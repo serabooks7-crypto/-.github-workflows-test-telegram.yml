@@ -27,22 +27,20 @@ jobs:
           pip install -r requirements.txt
 
       - name: Validate Python syntax
-        run: |
-          python -m py_compile research_v4.py
+        run: python -m py_compile research_v4.py
 
       - name: Run V4 Research Engine
         env:
-          SYMBOL: GC=F
-          INTERVAL: 5m
-          PERIOD: 60d
-        run: |
-          python research_v4.py
+          SYMBOL: "GC=F"
+          INTERVAL: "5m"
+          PERIOD: "60d"
+        run: python research_v4.py
 
       - name: Upload V4 Research Reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: RLA-V4-Research-Reports
-          path: path: research_v4_output/
+          path: research_v4_output/
           if-no-files-found: warn
           retention-days: 30
