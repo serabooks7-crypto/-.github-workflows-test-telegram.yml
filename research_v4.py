@@ -1,406 +1,928 @@
-"""
-RLA Research Engine V4
-Research-only Gold proxy backtester. It never places orders or sends signals.
 
-Data caveats:
-- Default GC=F is a Yahoo continuous COMEX gold futures proxy, NOT broker MT5 XAUUSD.
-- OHLC bars cannot provide true footprint, DOM, CVD, options positioning or institutional order flow.
-- CRT Sweep is a rules-based proxy, not a complete discretionary CRT/TBS model.
-- Set realistic round-turn costs in GC=F price units before interpreting net results.
-"""
-
-from pathlib import Path
 import os
 import warnings
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-# ---------------- USER CONFIG ----------------
+# ==========================================================
+# RLA V4 | XAUUSD A+ RESEARCH ENGINE
+# Research and alert preparation only. No live execution.
+# ==========================================================
+
+VERSION = "RLA_V4"
 SYMBOL = os.getenv("RLA_SYMBOL", "GC=F")
-INTERVAL = os.getenv("RLA_INTERVAL", "5m")
+INTERVAL = "5m"
 PERIOD = os.getenv("RLA_PERIOD", "60d")
-TRAIN_FRACTION = 0.70
-MAX_HOLDING_BARS = 48                 # 4 hours on 5m bars
+
+MIN_RR = 4.0
 ATR_PERIOD = 14
-STOP_ATR_MULTIPLIER = 1.25
-RR_LEVELS = [1, 1.5, 2, 3, 4, 5]
-ROUND_TURN_COST_PRICE = float(os.getenv("RLA_ROUND_TURN_COST_PRICE", "0.0"))
-SLIPPAGE_PRICE_PER_SIDE = float(os.getenv("RLA_SLIPPAGE_PRICE_PER_SIDE", "0.0"))
-OUTPUT_DIR = Path("research_v4_output")
-OUTPUT_DIR.mkdir(exist_ok=True)
+MAX_HOLD_BARS = 48
+OUTPUT = Path("research_v4_output")
+OUTPUT.mkdir(exist_ok=True)
 
-# New York local trading windows; timezone conversion handles DST.
-# NY AM window includes London/NY overlap. No signals outside these windows.
-USE_SESSION_FILTER = True
-NY_WINDOWS = [(2, 5), (7, 12)]       # [start_hour, end_hour), New York time
+ROUND_TURN_COST = float(
+    os.getenv("RLA_ROUND_TURN_COST_PRICE", "0")
+)
+SLIPPAGE_PER_SIDE = float(
+    os.getenv("RLA_SLIPPAGE_PRICE_PER_SIDE", "0")
+)
 
+NY_TZ = "America/New_York"
+
+STRATEGIES = [
+    "CRT_LIQUIDITY_SWEEP",
+    "TBS_ENTRY",
+    "MSS_FVG",
+    "HTF_TREND_PULLBACK",
+    "OB_DISPLACEMENT",
+    "SESSION_JUDAS_AMD",
+]
+
+
+# ==========================================================
+# 1. DATA ENGINE
+# ==========================================================
 
 def download_data():
-    print(f"Downloading {SYMBOL} {INTERVAL} {PERIOD}...")
-    raw = yf.download(
-        SYMBOL, period=PERIOD, interval=INTERVAL,
-        auto_adjust=False, progress=False, threads=False
+    print("Downloading market data:", SYMBOL)
+
+    data = yf.download(
+        SYMBOL,
+        period=PERIOD,
+        interval=INTERVAL,
+        auto_adjust=False,
+        progress=False,
     )
-    if raw is None or raw.empty:
-        raise RuntimeError("Yahoo Finance returned no data.")
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = raw.columns.get_level_values(0)
 
-    required = ["Open", "High", "Low", "Close"]
-    missing = [c for c in required if c not in raw.columns]
-    if missing:
-        raise RuntimeError(f"Missing OHLC columns: {missing}")
+    if data.empty:
+        raise RuntimeError("Market data download failed.")
 
-    cols = required + (["Volume"] if "Volume" in raw.columns else [])
-    x = raw[cols].copy()
-    for c in cols:
-        x[c] = pd.to_numeric(x[c], errors="coerce")
-    x = x.replace([np.inf, -np.inf], np.nan).dropna(subset=required)
-    x = x[~x.index.duplicated(keep="last")].sort_index()
-    if x.index.tz is None:
-        # Yahoo intraday data is normally timezone-aware. If not, mark UTC.
-        x.index = x.index.tz_localize("UTC")
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+
+    data = data[
+        ["Open", "High", "Low", "Close", "Volume"]
+    ].copy()
+
+    data = data.dropna(
+        subset=["Open", "High", "Low", "Close"]
+    )
+
+    if data.index.tz is None:
+        data.index = data.index.tz_localize("UTC")
+
+    return data.sort_index()
+
+
+# ==========================================================
+# 2. TIMEFRAME RESAMPLING
+# ==========================================================
+
+def resample_ohlc(data, timeframe):
+    result = data.resample(
+        timeframe,
+        label="right",
+        closed="right",
+    ).agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum",
+    })
+
+    return result.dropna()
+
+
+def add_htf_context(data):
+    data = data.copy()
+
+    h1 = resample_ohlc(data, "1h")
+    h4 = resample_ohlc(data, "4h")
+
+    for higher, prefix in [
+        (h1, "H1"),
+        (h4, "H4"),
+    ]:
+        higher[prefix + "_EMA20"] = (
+            higher["Close"].ewm(span=20).mean()
+        )
+        higher[prefix + "_EMA50"] = (
+            higher["Close"].ewm(span=50).mean()
+        )
+        higher[prefix + "_EMA200"] = (
+            higher["Close"].ewm(span=200).mean()
+        )
+
+        higher[prefix + "_BULL"] = (
+            (higher["Close"] > higher[prefix + "_EMA50"]) &
+            (higher[prefix + "_EMA50"] >
+             higher[prefix + "_EMA200"])
+        )
+
+        higher[prefix + "_BEAR"] = (
+            (higher["Close"] < higher[prefix + "_EMA50"]) &
+            (higher[prefix + "_EMA50"] <
+             higher[prefix + "_EMA200"])
+        )
+
+    # Backward as-of join: only completed HTF candles are used.
+    left = data.reset_index()
+    time_column = left.columns[0]
+    left = left.rename(columns={time_column: "Timestamp"})
+
+    for higher, prefix in [
+        (h1, "H1"),
+        (h4, "H4"),
+    ]:
+        right = higher[
+            [
+                prefix + "_BULL",
+                prefix + "_BEAR",
+            ]
+        ].reset_index()
+
+        right = right.rename(
+            columns={right.columns[0]: "Timestamp"}
+        )
+
+        left = pd.merge_asof(
+            left.sort_values("Timestamp"),
+            right.sort_values("Timestamp"),
+            on="Timestamp",
+            direction="backward",
+        )
+
+    left = left.set_index("Timestamp")
+    return left
+
+
+# ==========================================================
+# 3. INDICATORS AND MARKET STRUCTURE
+# ==========================================================
+
+def add_market_features(data):
+    df = data.copy()
+
+    df["EMA20"] = df["Close"].ewm(span=20).mean()
+    df["EMA50"] = df["Close"].ewm(span=50).mean()
+    df["EMA200"] = df["Close"].ewm(span=200).mean()
+
+    prev_close = df["Close"].shift(1)
+
+    tr = pd.concat(
+        [
+            df["High"] - df["Low"],
+            (df["High"] - prev_close).abs(),
+            (df["Low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    df["ATR"] = tr.rolling(ATR_PERIOD).mean()
+
+    df["SwingHigh"] = (
+        df["High"].rolling(12).max().shift(1)
+    )
+    df["SwingLow"] = (
+        df["Low"].rolling(12).min().shift(1)
+    )
+
+    df["RangeHigh"] = (
+        df["High"].rolling(20).max().shift(1)
+    )
+    df["RangeLow"] = (
+        df["Low"].rolling(20).min().shift(1)
+    )
+
+    df["Body"] = (
+        df["Close"] - df["Open"]
+    ).abs()
+
+    df["BullDisplacement"] = (
+        (df["Close"] > df["Open"]) &
+        (df["Body"] > df["ATR"] * 0.8)
+    )
+
+    df["BearDisplacement"] = (
+        (df["Close"] < df["Open"]) &
+        (df["Body"] > df["ATR"] * 0.8)
+    )
+
+    df["BullFVG"] = (
+        df["Low"] > df["High"].shift(2)
+    )
+
+    df["BearFVG"] = (
+        df["High"] < df["Low"].shift(2)
+    )
+
+    df["MSS_BULL"] = (
+        df["Close"] > df["SwingHigh"]
+    )
+
+    df["MSS_BEAR"] = (
+        df["Close"] < df["SwingLow"]
+    )
+
+    df["HTF_BULL"] = (
+        df["H1_BULL"].fillna(False) &
+        df["H4_BULL"].fillna(False)
+    )
+
+    df["HTF_BEAR"] = (
+        df["H1_BEAR"].fillna(False) &
+        df["H4_BEAR"].fillna(False)
+    )
+
+    return df
+
+
+# ==========================================================
+# 4. SESSION AND LIQUIDITY CONTEXT
+# ==========================================================
+
+def add_session_context(data):
+    df = data.copy()
+    local = df.index.tz_convert(NY_TZ)
+
+    df["NY_DATE"] = local.date
+    df["NY_HOUR"] = local.hour
+    df["NY_MINUTE"] = local.hour * 60 + local.minute
+
+    # New York morning research window
+    df["NY_MORNING"] = (
+        (df["NY_HOUR"] >= 7) &
+        (df["NY_HOUR"] < 11)
+    )
+
+    # Prior day high/low using completed previous NY day.
+    daily = df.groupby("NY_DATE").agg(
+        PDH=("High", "max"),
+        PDL=("Low", "min"),
+    )
+
+    daily["PDH"] = daily["PDH"].shift(1)
+    daily["PDL"] = daily["PDL"].shift(1)
+
+    df["PDH"] = df["NY_DATE"].map(daily["PDH"])
+    df["PDL"] = df["NY_DATE"].map(daily["PDL"])
+
+    df["SWEEP_LOW"] = (
+        (df["Low"] < df["RangeLow"]) &
+        (df["Close"] > df["RangeLow"])
+    )
+
+    df["SWEEP_HIGH"] = (
+        (df["High"] > df["RangeHigh"]) &
+        (df["Close"] < df["RangeHigh"])
+    )
+
+    df["PDL_SWEEP"] = (
+        (df["Low"] < df["PDL"]) &
+        (df["Close"] > df["PDL"])
+    )
+
+    df["PDH_SWEEP"] = (
+        (df["High"] > df["PDH"]) &
+        (df["Close"] < df["PDH"])
+    )
+
+    return df
+
+
+# ==========================================================
+# 5. SIX STRATEGY SIGNAL MODELS
+# ==========================================================
+
+def generate_strategy_signals(data):
+    df = data.copy()
+
+    for strategy in STRATEGIES:
+        df[strategy + "_BUY"] = False
+        df[strategy + "_SELL"] = False
+
+    # Strategy 1: CRT + Liquidity Sweep
+    df["CRT_LIQUIDITY_SWEEP_BUY"] = (
+        df["SWEEP_LOW"] &
+        df["BullDisplacement"] &
+        df["HTF_BULL"]
+    )
+
+    df["CRT_LIQUIDITY_SWEEP_SELL"] = (
+        df["SWEEP_HIGH"] &
+        df["BearDisplacement"] &
+        df["HTF_BEAR"]
+    )
+
+    # Strategy 2: TBS sweep then confirmation
+    df["TBS_ENTRY_BUY"] = (
+        df["SWEEP_LOW"].shift(1).fillna(False) &
+        df["MSS_BULL"] &
+        df["BullDisplacement"] &
+        df["HTF_BULL"]
+    )
+
+    df["TBS_ENTRY_SELL"] = (
+        df["SWEEP_HIGH"].shift(1).fillna(False) &
+        df["MSS_BEAR"] &
+        df["BearDisplacement"] &
+        df["HTF_BEAR"]
+    )
+
+    # Strategy 3: MSS + FVG
+    df["MSS_FVG_BUY"] = (
+        df["MSS_BULL"] &
+        df["BullFVG"] &
+        df["BullDisplacement"] &
+        df["HTF_BULL"]
+    )
+
+    df["MSS_FVG_SELL"] = (
+        df["MSS_BEAR"] &
+        df["BearFVG"] &
+        df["BearDisplacement"] &
+        df["HTF_BEAR"]
+    )
+
+    # Strategy 4: HTF Trend Pullback
+    df["HTF_TREND_PULLBACK_BUY"] = (
+        df["HTF_BULL"] &
+        (df["Low"] <= df["EMA20"]) &
+        (df["Close"] > df["EMA20"]) &
+        (df["Close"] > df["Open"])
+    )
+
+    df["HTF_TREND_PULLBACK_SELL"] = (
+        df["HTF_BEAR"] &
+        (df["High"] >= df["EMA20"]) &
+        (df["Close"] < df["EMA20"]) &
+        (df["Close"] < df["Open"])
+    )
+
+    # Strategy 5: Order Block + Displacement proxy
+    previous_bear = (
+        df["Close"].shift(1) < df["Open"].shift(1)
+    )
+    previous_bull = (
+        df["Close"].shift(1) > df["Open"].shift(1)
+    )
+
+    df["OB_DISPLACEMENT_BUY"] = (
+        previous_bear &
+        df["BullDisplacement"] &
+        (df["Close"] > df["High"].shift(1)) &
+        df["HTF_BULL"]
+    )
+
+    df["OB_DISPLACEMENT_SELL"] = (
+        previous_bull &
+        df["BearDisplacement"] &
+        (df["Close"] < df["Low"].shift(1)) &
+        df["HTF_BEAR"]
+    )
+
+    # Strategy 6: Session Judas / AMD proxy
+    df["SESSION_JUDAS_AMD_BUY"] = (
+        df["NY_MORNING"] &
+        (df["PDL_SWEEP"] | df["SWEEP_LOW"]) &
+        df["BullDisplacement"] &
+        df["HTF_BULL"]
+    )
+
+    df["SESSION_JUDAS_AMD_SELL"] = (
+        df["NY_MORNING"] &
+        (df["PDH_SWEEP"] | df["SWEEP_HIGH"]) &
+        df["BearDisplacement"] &
+        df["HTF_BEAR"]
+    )
+
+    return df
+
+# ==========================================================
+# 6. A+ SETUP QUALITY FILTER
+# ==========================================================
+
+def is_a_plus_setup(row, strategy, direction):
+    """
+    A+ means a clean, context-aligned setup.
+    This is a rule-based research filter, not a guaranteed
+    prediction or a claim of 80% win rate.
+    """
+
+    if direction == "BUY":
+        if not bool(row.get("HTF_BULL", False)):
+            return False
+        if not bool(row.get("BullDisplacement", False)):
+            return False
     else:
-        x.index = x.index.tz_convert("UTC")
-    if len(x) > 1:
-        x = x.iloc[:-1]  # discard possibly forming candle
-    if len(x) < 1500:
-        raise RuntimeError(f"Only {len(x)} completed bars; at least 1500 required.")
-    print(f"Completed bars: {len(x)} | {x.index[0]} -> {x.index[-1]}")
-    print("WARNING: GC=F is a futures proxy, not broker XAUUSD.")
-    return x
+        if not bool(row.get("HTF_BEAR", False)):
+            return False
+        if not bool(row.get("BearDisplacement", False)):
+            return False
+
+    # Strategy-specific confirmation
+    if strategy == "CRT_LIQUIDITY_SWEEP":
+        return bool(
+            row["SWEEP_LOW"] if direction == "BUY"
+            else row["SWEEP_HIGH"]
+        )
+
+    if strategy == "TBS_ENTRY":
+        return bool(
+            row["MSS_BULL"] if direction == "BUY"
+            else row["MSS_BEAR"]
+        )
+
+    if strategy == "MSS_FVG":
+        return bool(
+            row["BullFVG"] if direction == "BUY"
+            else row["BearFVG"]
+        )
+
+    if strategy == "HTF_TREND_PULLBACK":
+        return bool(
+            row["Close"] > row["EMA20"] if direction == "BUY"
+            else row["Close"] < row["EMA20"]
+        )
+
+    if strategy == "OB_DISPLACEMENT":
+        return True
+
+    if strategy == "SESSION_JUDAS_AMD":
+        return bool(row["NY_MORNING"])
+
+    return False
 
 
-def add_features(df):
-    x = df.copy()
-    c, h, l, o = x.Close, x.High, x.Low, x.Open
+# ==========================================================
+# 7. ENTRY, STOP LOSS AND TAKE PROFIT
+# ==========================================================
 
-    # Local structure and volatility.
-    x["EMA20"] = c.ewm(span=20, adjust=False).mean()
-    x["EMA50"] = c.ewm(span=50, adjust=False).mean()
-    x["EMA200"] = c.ewm(span=200, adjust=False).mean()
-    prev = c.shift(1)
-    tr = pd.concat([(h-l), (h-prev).abs(), (l-prev).abs()], axis=1).max(axis=1)
-    x["ATR"] = tr.ewm(alpha=1/ATR_PERIOD, adjust=False).mean()
-    delta = c.diff()
-    avg_gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-    avg_loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    x["RSI"] = 100 - 100/(1+rs)
+def build_trade_levels(data, signal_index, direction):
+    """
+    Signal is confirmed at candle close.
+    Entry is the NEXT candle open.
+    """
 
-    # Previous-bar-only liquidity references (no current-bar lookahead).
-    x["PREV_H20"] = h.shift(1).rolling(20).max()
-    x["PREV_L20"] = l.shift(1).rolling(20).min()
-    x["PREV_H12"] = h.shift(1).rolling(12).max()
-    x["PREV_L12"] = l.shift(1).rolling(12).min()
-    x["PREV_H5"] = h.shift(1).rolling(5).max()
-    x["PREV_L5"] = l.shift(1).rolling(5).min()
+    if signal_index + 1 >= len(data):
+        return None
 
-    candle_range = (h-l).replace(0, np.nan)
-    x["BODY_ATR"] = (c-o).abs()/x["ATR"]
-    x["CLOSE_LOC"] = (c-l)/candle_range
+    signal = data.iloc[signal_index]
+    next_bar = data.iloc[signal_index + 1]
 
-    # Higher-timeframe bias: completed 1h and 4h bars only.
-    # Resample labels at bar close, then forward-fill onto 5m timestamps.
-    for rule, tag in [("1h", "H1"), ("4h", "H4")]:
-        ht = x[["Open", "High", "Low", "Close"]].resample(
-            rule, label="right", closed="right"
-        ).agg({"Open":"first", "High":"max", "Low":"min", "Close":"last"}).dropna()
-        ht[f"{tag}_EMA20"] = ht.Close.ewm(span=20, adjust=False).mean()
-        ht[f"{tag}_EMA50"] = ht.Close.ewm(span=50, adjust=False).mean()
-        ht[f"{tag}_EMA200"] = ht.Close.ewm(span=200, adjust=False).mean()
-        ht = ht[[f"{tag}_EMA20", f"{tag}_EMA50", f"{tag}_EMA200"]]
-        x = x.join(ht.reindex(x.index, method="ffill"))
+    atr = signal["ATR"]
 
-    # Session filter based on New York clock, including daylight saving.
-    ny = x.index.tz_convert("America/New_York")
-    hour = pd.Series(ny.hour, index=x.index)
-    if USE_SESSION_FILTER:
-        allowed = pd.Series(False, index=x.index)
-        for start, end in NY_WINDOWS:
-            allowed |= (hour >= start) & (hour < end)
-        x["IN_SESSION"] = allowed
+    if pd.isna(atr) or atr <= 0:
+        return None
+
+    entry = float(next_bar["Open"])
+
+    if direction == "BUY":
+        swing_stop = float(
+            data["Low"].iloc[
+                max(0, signal_index - 5):signal_index + 1
+            ].min()
+        )
+
+        stop = swing_stop - float(atr) * 0.15
+        risk = entry - stop
+
+        if risk <= 0:
+            return None
+
+        target = entry + risk * MIN_RR
+
     else:
-        x["IN_SESSION"] = True
+        swing_stop = float(
+            data["High"].iloc[
+                max(0, signal_index - 5):signal_index + 1
+            ].max()
+        )
 
-    return x.replace([np.inf, -np.inf], np.nan)
+        stop = swing_stop + float(atr) * 0.15
+        risk = stop - entry
 
+        if risk <= 0:
+            return None
 
-def build_signals(x):
-    z = x.copy()
-    # HTF consensus filters reduce counter-trend entries.
-    htf_bull = (
-        (z.H1_EMA20 > z.H1_EMA50) &
-        (z.H4_EMA20 > z.H4_EMA50)
-    )
-    htf_bear = (
-        (z.H1_EMA20 < z.H1_EMA50) &
-        (z.H4_EMA20 < z.H4_EMA50)
-    )
+        target = entry - risk * MIN_RR
 
-    # 1) CRT-like liquidity sweep + reclaim + local MSS/displacement proxy.
-    # A sell sweep takes prior highs, closes back below, and closes below
-    # a recent micro swing low. Buy is the inverse.
-    z["CRT_SWEEP_SELL"] = (
-        z.IN_SESSION &
-        (z.High > z.PREV_H20) & (z.Close < z.PREV_H20) &
-        (z.Close < z.Open) & (z.CLOSE_LOC < 0.30) &
-        (z.Close < z.PREV_L5) & (z.BODY_ATR >= 0.35) &
-        htf_bear & z.RSI.between(25, 55)
-    )
-    z["CRT_SWEEP_BUY"] = (
-        z.IN_SESSION &
-        (z.Low < z.PREV_L20) & (z.Close > z.PREV_L20) &
-        (z.Close > z.Open) & (z.CLOSE_LOC > 0.70) &
-        (z.Close > z.PREV_H5) & (z.BODY_ATR >= 0.35) &
-        htf_bull & z.RSI.between(45, 75)
-    )
+    if risk < float(atr) * 0.10:
+        return None
 
-    # 2) Trend pullback, aligned to both higher timeframes.
-    z["TREND_PULLBACK_SELL"] = (
-        z.IN_SESSION & htf_bear &
-        (z.EMA20 < z.EMA50) & (z.EMA50 < z.EMA200) &
-        (z.High >= z.EMA20) & (z.Close < z.EMA20) &
-        (z.Close < z.Open) & z.RSI.between(30, 50) &
-        (z.BODY_ATR >= 0.15)
-    )
-    z["TREND_PULLBACK_BUY"] = (
-        z.IN_SESSION & htf_bull &
-        (z.EMA20 > z.EMA50) & (z.EMA50 > z.EMA200) &
-        (z.Low <= z.EMA20) & (z.Close > z.EMA20) &
-        (z.Close > z.Open) & z.RSI.between(50, 70) &
-        (z.BODY_ATR >= 0.15)
-    )
-
-    # 3) Range expansion breakout with volatility expansion and HTF agreement.
-    atr_mean = z.ATR.rolling(50).mean()
-    z["RANGE_EXPANSION_SELL"] = (
-        z.IN_SESSION & htf_bear &
-        (z.Close < z.PREV_L12) & (z.Close < z.Open) &
-        (z.BODY_ATR >= 0.60) & (z.ATR > atr_mean) &
-        (z.CLOSE_LOC < 0.25) & (z.RSI < 48)
-    )
-    z["RANGE_EXPANSION_BUY"] = (
-        z.IN_SESSION & htf_bull &
-        (z.Close > z.PREV_H12) & (z.Close > z.Open) &
-        (z.BODY_ATR >= 0.60) & (z.ATR > atr_mean) &
-        (z.CLOSE_LOC > 0.75) & (z.RSI > 52)
-    )
-
-    signal_cols = [
-        "CRT_SWEEP_SELL", "CRT_SWEEP_BUY",
-        "TREND_PULLBACK_SELL", "TREND_PULLBACK_BUY",
-        "RANGE_EXPANSION_SELL", "RANGE_EXPANSION_BUY"
-    ]
-    # Preserve warmup rows as false; only indicators required for a model matter.
-    for col in signal_cols:
-        z[col] = z[col].fillna(False).astype(bool)
-    return z, signal_cols
-
-
-def backtest_model(x, signal_col, rr, split_index):
-    direction = "BUY" if signal_col.endswith("_BUY") else "SELL"
-    trades = []
-    next_free = 0
-    n = len(x)
-    valid_start = 300
-
-    for i in range(valid_start, n - MAX_HOLDING_BARS - 2):
-        if i < next_free or not bool(x.iloc[i][signal_col]):
-            continue
-        # Strictly purge any possible holding window crossing train/test boundary.
-        if i < split_index and i + MAX_HOLDING_BARS + 1 >= split_index:
-            continue
-
-        entry_i = i + 1
-        entry = float(x.iloc[entry_i].Open)
-        atr = float(x.iloc[i].ATR)
-        if not np.isfinite(entry) or not np.isfinite(atr) or atr <= 0:
-            continue
-
-        risk = STOP_ATR_MULTIPLIER * atr
-        if direction == "BUY":
-            sl, tp = entry-risk, entry+rr*risk
-        else:
-            sl, tp = entry+risk, entry-rr*risk
-
-        outcome, exit_price, exit_i = "TIMEOUT", None, None
-        end_i = min(i + MAX_HOLDING_BARS + 1, n-1)
-        for j in range(entry_i, end_i+1):
-            bar = x.iloc[j]
-            op, hi, lo = float(bar.Open), float(bar.High), float(bar.Low)
-            if direction == "BUY":
-                if op <= sl:
-                    outcome, exit_price, exit_i = "LOSS_GAP", op, j
-                    break
-                if op >= tp:
-                    outcome, exit_price, exit_i = "TP_GAP", op, j
-                    break
-                hit_sl, hit_tp = lo <= sl, hi >= tp
-            else:
-                if op >= sl:
-                    outcome, exit_price, exit_i = "LOSS_GAP", op, j
-                    break
-                if op <= tp:
-                    outcome, exit_price, exit_i = "TP_GAP", op, j
-                    break
-                hit_sl, hit_tp = hi >= sl, lo <= tp
-
-            # Conservative intrabar ambiguity: stop wins if both levels touched.
-            if hit_sl:
-                outcome, exit_price, exit_i = "LOSS", sl, j
-                break
-            if hit_tp:
-                outcome, exit_price, exit_i = "TP", tp, j
-                break
-
-        if exit_i is None:
-            exit_i = end_i
-            exit_price = float(x.iloc[end_i].Close)
-
-        gross = (exit_price-entry) if direction == "BUY" else (entry-exit_price)
-        costs = ROUND_TURN_COST_PRICE + 2*SLIPPAGE_PRICE_PER_SIDE
-        net = gross - costs
-        net_r = net/risk
-
-        trades.append({
-            "signal_time_utc": x.index[i],
-            "entry_time_utc": x.index[entry_i],
-            "exit_time_utc": x.index[exit_i],
-            "signal_model": signal_col,
-            "direction": direction,
-            "target_RR": rr,
-            "entry": entry, "sl": sl, "tp": tp, "exit_price": exit_price,
-            "outcome": outcome,
-            "gross_pnl_price": gross,
-            "round_turn_cost_price": ROUND_TURN_COST_PRICE,
-            "slippage_price_per_side": SLIPPAGE_PRICE_PER_SIDE,
-            "total_cost_price": costs,
-            "net_pnl_price": net, "net_R": net_r,
-            "risk_price": risk,
-            "bars_held": exit_i-entry_i,
-            "sample": "IN_SAMPLE" if i < split_index else "OUT_OF_SAMPLE",
-            "session_filter": "NY London/NY windows"
-        })
-        next_free = exit_i + 1
-
-    return trades
-
-
-def calc_metrics(g):
-    if g.empty:
-        return {}
-    n = len(g)
-    tp = g.outcome.str.startswith("TP").sum()
-    sl = g.outcome.str.startswith("LOSS").sum()
-    wins = (g.net_R > 0).sum()
-    gains = g.loc[g.net_R > 0, "net_R"].sum()
-    losses = abs(g.loc[g.net_R < 0, "net_R"].sum())
-    pf = gains/losses if losses > 0 else np.inf
-    eq = pd.concat([pd.Series([0.0]), g.net_R.reset_index(drop=True)]).cumsum()
-    dd = eq - eq.cummax()
     return {
-        "trades": int(n),
-        "TP_hit_rate_pct": round(tp/n*100, 2),
-        "profitable_trade_rate_pct": round(wins/n*100, 2),
-        "SL_rate_pct": round(sl/n*100, 2),
-        "average_net_R": round(g.net_R.mean(), 4),
-        "median_net_R": round(g.net_R.median(), 4),
-        "profit_factor_R": round(pf, 4) if np.isfinite(pf) else "Inf",
-        "max_drawdown_R": round(abs(dd.min()), 4),
-        "total_net_R": round(g.net_R.sum(), 4),
-        "avg_bars_held": round(g.bars_held.mean(), 2)
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "risk": risk,
+        "planned_rr": MIN_RR,
     }
 
 
-def main():
-    print("=== RLA RESEARCH ENGINE V4 | RESEARCH ONLY ===")
-    print(f"Symbol={SYMBOL} | Interval={INTERVAL} | Period={PERIOD}")
-    print(f"Round-turn cost={ROUND_TURN_COST_PRICE} | Slippage/side={SLIPPAGE_PRICE_PER_SIDE}")
-    if ROUND_TURN_COST_PRICE == 0 and SLIPPAGE_PRICE_PER_SIDE == 0:
-        print("WARNING: costs are zero. Net results are not execution-realistic.")
-    print("HTF: completed 1h + 4h EMA bias | Session: NY 02-05 and 07-12")
-    print("No live trading, no Telegram alerts.")
+# ==========================================================
+# 8. TRADE SIMULATION
+# ==========================================================
 
-    data = add_features(download_data())
-    data, models = build_signals(data)
-    data = data.dropna(subset=[
-        "ATR", "EMA20", "EMA50", "EMA200",
-        "H1_EMA20", "H1_EMA50", "H4_EMA20", "H4_EMA50",
-        "PREV_H20", "PREV_L20", "PREV_H12", "PREV_L12",
-        "PREV_H5", "PREV_L5"
-    ]).copy()
-    split = int(len(data)*TRAIN_FRACTION)
-    print(f"Usable bars={len(data)} | Train={split} | OOS={len(data)-split}")
+def simulate_trade(data, signal_index, strategy, direction):
+    levels = build_trade_levels(
+        data, signal_index, direction
+    )
 
-    all_trades = []
-    for model in models:
-        for rr in RR_LEVELS:
-            print(f"Testing {model} | 1:{rr}")
-            all_trades.extend(backtest_model(data, model, rr, split))
+    if levels is None:
+        return None
 
-    if not all_trades:
-        raise RuntimeError("No trades generated. Review data, session window or filters.")
+    entry_index = signal_index + 1
+    last_index = min(
+        entry_index + MAX_HOLD_BARS - 1,
+        len(data) - 1
+    )
 
-    trades = pd.DataFrame(all_trades)
-    trades.to_csv(OUTPUT_DIR/"all_trades_v4.csv", index=False)
+    entry = levels["entry"]
+    stop = levels["stop"]
+    target = levels["target"]
+    risk = levels["risk"]
 
-    rows = []
-    for sample in ["IN_SAMPLE", "OUT_OF_SAMPLE"]:
-        for model in models:
-            direction = "BUY" if model.endswith("_BUY") else "SELL"
-            for rr in RR_LEVELS:
-                g = trades[
-                    (trades["sample"] == sample) &
-                    (trades["signal_model"] == model) &
-                    (trades["target_RR"] == rr)
-                ]
-                m = calc_metrics(g)
-                if m:
-                    rows.append({
-                        "sample": sample, "model": model,
-                        "direction": direction, "target_RR": rr, **m
-                    })
+    exit_price = None
+    exit_reason = "TIMEOUT"
+    exit_index = last_index
 
-    report = pd.DataFrame(rows)
-    report.to_csv(OUTPUT_DIR/"performance_report_v4.csv", index=False)
+    for j in range(entry_index, last_index + 1):
+        bar = data.iloc[j]
 
-    oos = report[
-        (report["sample"] == "OUT_OF_SAMPLE") &
-        (report["trades"] >= 30)
-    ].copy()
-    if not oos.empty:
-        oos["pf_sort"] = pd.to_numeric(oos.profit_factor_R, errors="coerce")
-        oos = oos.sort_values(
-            ["average_net_R", "pf_sort", "trades"],
-            ascending=[False, False, False]
-        )
-        oos.to_csv(OUTPUT_DIR/"oos_research_ranking_v4.csv", index=False)
+        if direction == "BUY":
+            # Gap-aware stop
+            if float(bar["Open"]) <= stop:
+                exit_price = float(bar["Open"])
+                exit_reason = "SL_GAP"
+                exit_index = j
+                break
 
-    # Signal frequency diagnostics by model, independently of RR expansion.
-    diag = []
-    for model in models:
-        diag.append({
-            "model": model,
-            "signal_bars": int(data[model].sum()),
-            "session_bars": int(data.IN_SESSION.sum()),
-            "signal_rate_pct_of_session_bars": round(
-                data[model].sum()/max(1, data.IN_SESSION.sum())*100, 3
-            )
-        })
-    pd.DataFrame(diag).to_csv(OUTPUT_DIR/"signal_diagnostics_v4.csv", index=False)
+            # Gap-aware target
+            if float(bar["Open"]) >= target:
+                exit_price = target
+                exit_reason = "TP_GAP"
+                exit_index = j
+                break
 
-    print("\n=== OOS RESEARCH RANKING (min 30 trades) ===")
-    if not oos.empty:
-        print(oos.to_string(index=False))
+            hit_sl = float(bar["Low"]) <= stop
+            hit_tp = float(bar["High"]) >= target
+
+        else:
+            if float(bar["Open"]) >= stop:
+                exit_price = float(bar["Open"])
+                exit_reason = "SL_GAP"
+                exit_index = j
+                break
+
+            if float(bar["Open"]) <= target:
+                exit_price = target
+                exit_reason = "TP_GAP"
+                exit_index = j
+                break
+
+            hit_sl = float(bar["High"]) >= stop
+            hit_tp = float(bar["Low"]) <= target
+
+        # Conservative assumption:
+        # SL is first when both levels are touched in one bar.
+        if hit_sl:
+            exit_price = stop
+            exit_reason = "SL"
+            exit_index = j
+            break
+
+        if hit_tp:
+            exit_price = target
+            exit_reason = "TP"
+            exit_index = j
+            break
+
+    if exit_price is None:
+        exit_price = float(data["Close"].iloc[exit_index])
+
+    if direction == "BUY":
+        gross_r = (exit_price - entry) / risk
     else:
-        print("No model reached 30 OOS trades.")
-    print("\nReports saved in:", OUTPUT_DIR)
-    print("IMPORTANT: Research candidates only; no model is approved for live use.")
-    print("Validate against broker MT5 XAUUSD data and realistic costs before conclusions.")
+        gross_r = (entry - exit_price) / risk
+
+    total_cost = (
+        ROUND_TURN_COST + 2 * SLIPPAGE_PER_SIDE
+    )
+
+    net_r = gross_r - total_cost / risk
+
+    signal_time = data.index[signal_index]
+    entry_time = data.index[entry_index]
+    exit_time = data.index[exit_index]
+
+    return {
+        "strategy": strategy,
+        "direction": direction,
+        "signal_time": signal_time,
+        "entry_time": entry_time,
+        "exit_time": exit_time,
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "exit_price": exit_price,
+        "planned_rr": MIN_RR,
+        "exit_reason": exit_reason,
+        "gross_r": gross_r,
+        "net_r": net_r,
+        "win": net_r > 0,
+        "tp_hit": exit_reason in ("TP", "TP_GAP"),
+    }
+
+
+# ==========================================================
+# 9. INDIVIDUAL STRATEGY BACKTEST
+# ==========================================================
+
+def backtest_strategy(data, strategy, direction):
+    signal_column = strategy + "_" + direction
+    trades = []
+
+    start_index = 210
+    end_index = len(data) - MAX_HOLD_BARS - 1
+
+    for i in range(start_index, end_index):
+        if not bool(data[signal_column].iloc[i]):
+            continue
+
+        row = data.iloc[i]
+
+        if not is_a_plus_setup(row, strategy, direction):
+            continue
+
+        trade = simulate_trade(
+            data, i, strategy, direction
+        )
+
+        if trade is not None:
+            trades.append(trade)
+
+    return pd.DataFrame(trades)
+
+
+def run_strategy_backtests(data):
+    results = []
+
+    for strategy in STRATEGIES:
+        for direction in ("BUY", "SELL"):
+            trades = backtest_strategy(
+                data, strategy, direction
+            )
+
+            if not trades.empty:
+                results.append(trades)
+
+    if not results:
+        return pd.DataFrame()
+
+    return pd.concat(results, ignore_index=True)
+
+
+# ==========================================================
+# 10. COMBINED PORTFOLIO
+# ==========================================================
+
+def build_combined_portfolio(candidates):
+    if candidates.empty:
+        return candidates.copy()
+
+    df = candidates.copy()
+
+    df["entry_time"] = pd.to_datetime(
+        df["entry_time"], utc=True
+    )
+    df["exit_time"] = pd.to_datetime(
+        df["exit_time"], utc=True
+    )
+
+    # Priority only resolves simultaneous competing signals.
+    priority = {
+        "CRT_LIQUIDITY_SWEEP": 1,
+        "TBS_ENTRY": 2,
+        "MSS_FVG": 3,
+        "OB_DISPLACEMENT": 4,
+        "SESSION_JUDAS_AMD": 5,
+        "HTF_TREND_PULLBACK": 6,
+    }
+
+    df["priority"] = df["strategy"].map(priority)
+
+    df = df.sort_values(
+        ["entry_time", "priority"]
+    ).reset_index(drop=True)
+
+    selected = []
+    last_exit = None
+    recent = []
+
+    for _, trade in df.iterrows():
+        entry_time = trade["entry_time"]
+
+        # Remove signals older than 15 minutes.
+        recent = [
+            item for item in recent
+            if (entry_time - item[0]).total_seconds()
+            <= 900
+        ]
+
+        duplicate = any(
+            item[1] == trade["direction"]
+            for item in recent
+        )
+
+        if duplicate:
+            continue
+
+        # Avoid overlapping portfolio positions.
+        if last_exit is not None and entry_time < last_exit:
+            continue
+
+        selected.append(trade.to_dict())
+
+        recent.append(
+            (entry_time, trade["direction"])
+        )
+
+        last_exit = trade["exit_time"]
+
+    result = pd.DataFrame(selected)
+
+    if "priority" in result.columns:
+        result = result.drop(columns=["priority"])
+
+    return result
+
+
+# ==========================================================
+# 11. PERFORMANCE METRICS
+# ==========================================================
+
+def calculate_metrics(trades, period_name):
+    if trades.empty:
+        return {
+            "period": period_name,
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate_pct": 0.0,
+            "tp_hit_rate_pct": 0.0,
+            "profit_factor": 0.0,
+            "average_net_r": 0.0,
+            "total_net_r": 0.0,
+            "max_drawdown_r": 0.0,
+        }
+
+    net = trades["net_r"].astype(float)
+
+    wins = int((net > 0).sum())
+    losses = int((net <= 0).sum())
+
+    gross_profit = float(net[net > 0].sum())
+    gross_loss = abs(float(net[net < 0].sum()))
+
+    if gross_loss == 0:
+        pf = float("inf") if gross_profit > 0 else 0.0
+    else:
+        pf = gross_profit / gross_loss
+
+    equity = net.cumsum()
+    drawdown = equity - equity.cummax()
+
+    return {
+        "period": period_name,
+        "trades": len(trades),
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": round(
+            wins / len(trades) * 100, 2
+        ),
+        "tp_hit_rate_pct": round(
+            trades["tp_hit"].mean() * 100, 2
+        ),
+        "profit_factor": round(pf, 3),
+        "average_net_r": round(float(net.mean()), 3),
+        "total_net_r": round(float(net.sum()), 3),
+        "max_drawdown_r": round(
+            abs(float(drawdown.min())), 3
+        ),
+    }
+
+
+def make_strategy_report(trades, period_name):
+    rows = []
+
+    if trades.empty:
+        return pd.DataFrame()
+
+    for strategy, group in trades.groupby("strategy"):
+        row = calculate_metrics(group, period_name)
+        row["strategy"] = strategy
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# ==========================================================
+# 12. MAIN RESEARCH PIPELINE
+# ==========================================================
+
+def main():
+    print("=" * 60)
+    print(VERSION, "START")
+    print("=" * 60)
+
+    data = download_data()
+    data = add_htf_context(data)
+    data = add_market_features(data)
+    data = add_session_context(data)
+    data = generate_strategy_signals(data)
+
+    data = data.dropna(
+        subset=["ATR", "H1_BULL", "H4_BULL"]
+    )
+
+    if len(data) < 500:
+        raise RuntimeError(
+            "Insufficient data after feature preparation."
+        )
+
+    # Chronological 70/30 split.
+    split = int(len(data) * 0.70)
+
+    in_sample = data.iloc[:split].copy()
+    out_sample = data.iloc[split:].copy()
+
+    print("Backtesting In-Sample...")
+    candidates_in = run_strategy_backtests(in_sample)
+
+    print("Backtesting Out-of-Sample...")
+    candidates_out = run_strategy_backtests(out_sample)
+
+    portfolio_in = build_combined_portfolio(
+        candidates_in
+    )
+
+    portfolio_out = build_combined_portfolio(
+        candidates_out
+    )
+
+    portfolio_in.to_csv(
+        OUTPUT / "portfolio_in_sample_v4.csv",
+        index=False
+    )
+
+    portfolio_out.to_csv(
+        OUTPUT / "portfolio_out_of_sample_v4.csv",
+        index=False
+    )
+
+    metrics_in = calculate_metrics(
+        portfolio_in, "IN_SAMPLE"
+    )
+
+    metrics_out = calculate_metrics(
+        portfolio_out, "OUT_OF_SAMPLE"
+    )
+
+    pd.DataFrame(
+        [metrics_in, metrics_out]
+    ).to_csv(
+        OUTPUT / "portfolio_performance_v4.csv",
+        index=False
+    )
+
+    make_strategy_report(
+        portfolio_in, "IN_SAMPLE"
+    ).to_csv(
+        OUTPUT / "strategy_in_sample_v4.csv",
+        index=False
+    )
+
+    make_strategy_report(
+        portfolio_out, "OUT_OF_SAMPLE"
+    ).to_csv(
+        OUTPUT / "strategy_out_of_sample_v4.csv",
+        index=False
+    )
+
+    print("\nIN-SAMPLE")
+    print(metrics_in)
+
+    print("\nOUT-OF-SAMPLE")
+    print(metrics_out)
+
+    print("\nReports saved in:", OUTPUT.resolve())
+    print("Research completed. No live trades placed.")
 
 
 if __name__ == "__main__":
