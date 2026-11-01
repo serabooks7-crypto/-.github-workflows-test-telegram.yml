@@ -25,9 +25,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run RLA Signal Bot
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - name: Run RLA Research Engine
         run: |
           python main.py
+
+      - name: Upload Backtest Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RLA-V2-Backtest-Reports
+          path: research_output/
+          if-no-files-found: warn
+          retention-days: 30
