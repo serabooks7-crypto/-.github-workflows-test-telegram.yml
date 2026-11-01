@@ -1,5 +1,4 @@
 
-import time
 import warnings
 from pathlib import Path
 
@@ -10,9 +9,9 @@ import yfinance as yf
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# RLA MULTI-STRATEGY RESEARCH ENGINE V1
-# XAUUSD proxy: GC=F (NOT broker XAUUSD)
-# Research only - no live trading signals
+# RLA MULTI-STRATEGY RESEARCH ENGINE V2
+# XAUUSD research proxy: GC=F
+# NOT FundingPips MT5 execution data
 # ==========================================
 
 SYMBOL = "GC=F"
@@ -24,8 +23,17 @@ EMA_FAST = 20
 EMA_SLOW = 50
 RSI_PERIOD = 14
 
-MIN_RR = 4.0
+# Test multiple reward targets.
+RR_LEVELS = [4, 5, 6, 8, 10]
+
+STOP_ATR_MULTIPLIER = 1.5
 MAX_HOLDING_BARS = 60
+
+# Set these after checking actual broker costs.
+# All values are in price units, not pips.
+SPREAD_PRICE = 0.0
+SLIPPAGE_PRICE = 0.0
+COMMISSION_PRICE = 0.0
 
 OUTPUT_DIR = Path("research_output")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -50,24 +58,28 @@ def download_data():
 
     required = ["Open", "High", "Low", "Close", "Volume"]
     df = df[required].copy()
+
+    for col in required:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
     df = df.dropna()
     df = df[~df.index.duplicated(keep="last")]
     df = df.sort_index()
 
-    if len(df) < 500:
-        raise RuntimeError("Insufficient historical candles.")
+    if len(df) < 1000:
+        raise RuntimeError(
+            f"Insufficient candles: {len(df)}"
+        )
 
-    # Remove the latest potentially incomplete candle.
+    # Remove potentially incomplete latest candle.
     df = df.iloc[:-1].copy()
 
-    age = pd.Timestamp.now(tz="UTC") - pd.Timestamp(
-        df.index[-1]
-    ).tz_convert("UTC")
+    if len(df) < 500:
+        raise RuntimeError("Not enough completed candles.")
 
-    if age.total_seconds() > 30 * 60:
-        raise RuntimeError(
-            "Market data is stale. Research stopped."
-        )
+    print("Candles downloaded:", len(df))
+    print("First candle:", df.index[0])
+    print("Last completed candle:", df.index[-1])
 
     return df
 
@@ -80,11 +92,13 @@ def calculate_indicators(df):
     low = df["Low"]
 
     df["EMA20"] = close.ewm(
-        span=EMA_FAST, adjust=False
+        span=EMA_FAST,
+        adjust=False
     ).mean()
 
     df["EMA50"] = close.ewm(
-        span=EMA_SLOW, adjust=False
+        span=EMA_SLOW,
+        adjust=False
     ).mean()
 
     delta = close.diff()
@@ -102,15 +116,16 @@ def calculate_indicators(df):
     ).mean()
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
+
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    previous_close = close.shift(1)
+    prev_close = close.shift(1)
 
     tr = pd.concat(
         [
             high - low,
-            (high - previous_close).abs(),
-            (low - previous_close).abs()
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
         ],
         axis=1
     ).max(axis=1)
@@ -120,18 +135,20 @@ def calculate_indicators(df):
         adjust=False
     ).mean()
 
-    df["PREV_HIGH"] = high.shift(1).rolling(20).max()
-    df["PREV_LOW"] = low.shift(1).rolling(20).min()
+    # Previous 20-candle range.
+    # Current candle is excluded.
+    df["RANGE_HIGH"] = high.shift(1).rolling(20).max()
+    df["RANGE_LOW"] = low.shift(1).rolling(20).min()
 
     # Liquidity sweep and reclaim.
-    df["SWEEP_LOW"] = (
-        (low < df["PREV_LOW"]) &
-        (close > df["PREV_LOW"])
+    df["SWEEP_BUY"] = (
+        (low < df["RANGE_LOW"]) &
+        (close > df["RANGE_LOW"])
     )
 
-    df["SWEEP_HIGH"] = (
-        (high > df["PREV_HIGH"]) &
-        (close < df["PREV_HIGH"])
+    df["SWEEP_SELL"] = (
+        (high > df["RANGE_HIGH"]) &
+        (close < df["RANGE_HIGH"])
     )
 
     return df.dropna()
@@ -155,65 +172,83 @@ def build_signals(df):
 
     # Model 2: Liquidity Sweep + Reclaim
     df["SWEEP_BUY"] = (
-        df["SWEEP_LOW"] &
+        df["SWEEP_BUY"] &
         (df["RSI"] > 45)
     )
 
     df["SWEEP_SELL"] = (
-        df["SWEEP_HIGH"] &
+        df["SWEEP_SELL"] &
         (df["RSI"] < 55)
     )
 
     # Model 3: Range Breakout
     df["BREAKOUT_BUY"] = (
-        (df["Close"] > df["PREV_HIGH"]) &
+        (df["Close"] > df["RANGE_HIGH"]) &
         (df["RSI"] > 60)
     )
 
     df["BREAKOUT_SELL"] = (
-        (df["Close"] < df["PREV_LOW"]) &
+        (df["Close"] < df["RANGE_LOW"]) &
         (df["RSI"] < 40)
     )
 
     return df
 
 
-def backtest_model(df, model, direction):
+def backtest_model(df, model, direction, rr):
     results = []
 
-    buy_col = model + "_BUY"
-    sell_col = model + "_SELL"
+    signal_col = model + "_" + direction
+    next_allowed_index = 0
 
-    for i in range(100, len(df) - MAX_HOLDING_BARS):
-        row = df.iloc[i]
+    total_cost = (
+        SPREAD_PRICE +
+        SLIPPAGE_PRICE +
+        COMMISSION_PRICE
+    )
 
-        if direction == "BUY" and not row[buy_col]:
+    for i in range(100, len(df) - MAX_HOLDING_BARS - 1):
+
+        # No overlapping positions in this model.
+        if i < next_allowed_index:
             continue
 
-        if direction == "SELL" and not row[sell_col]:
+        if not bool(df.iloc[i][signal_col]):
             continue
 
-        entry = float(row["Close"])
-        atr = float(row["ATR"])
+        signal_candle = df.iloc[i]
+        entry_candle = df.iloc[i + 1]
 
-        if not np.isfinite(atr) or atr <= 0:
+        # Entry at next candle open.
+        entry = float(entry_candle["Open"])
+        atr = float(signal_candle["ATR"])
+
+        if not np.isfinite(entry) or not np.isfinite(atr):
             continue
 
-        # Fixed risk distance for initial research.
-        risk = 1.5 * atr
+        if entry <= 0 or atr <= 0:
+            continue
+
+        risk = STOP_ATR_MULTIPLIER * atr
 
         if direction == "BUY":
             sl = entry - risk
-            tp = entry + (MIN_RR * risk)
+            tp = entry + (rr * risk)
         else:
             sl = entry + risk
-            tp = entry - (MIN_RR * risk)
+            tp = entry - (rr * risk)
 
         outcome = "TIMEOUT"
-        exit_price = float(df.iloc[i + MAX_HOLDING_BARS]["Close"])
-        exit_index = i + MAX_HOLDING_BARS
+        exit_price = None
+        exit_index = None
 
-        for j in range(i + 1, i + MAX_HOLDING_BARS + 1):
+        last_index = min(
+            i + MAX_HOLDING_BARS + 1,
+            len(df) - 1
+        )
+
+        for j in range(i + 1, last_index + 1):
+
             candle = df.iloc[j]
 
             if direction == "BUY":
@@ -223,8 +258,7 @@ def backtest_model(df, model, direction):
                 hit_sl = candle["High"] >= sl
                 hit_tp = candle["Low"] <= tp
 
-            # Conservative rule: if both hit in one candle,
-            # count SL first.
+            # Conservative same-candle rule.
             if hit_sl:
                 outcome = "LOSS"
                 exit_price = sl
@@ -232,33 +266,165 @@ def backtest_model(df, model, direction):
                 break
 
             if hit_tp:
-                outcome = "WIN"
+                outcome = "TP"
                 exit_price = tp
                 exit_index = j
                 break
 
+        if exit_index is None:
+            exit_index = last_index
+            exit_price = float(df.iloc[last_index]["Close"])
+
+        if direction == "BUY":
+            gross_pnl = exit_price - entry
+        else:
+            gross_pnl = entry - exit_price
+
+        net_pnl = gross_pnl - total_cost
+        net_r = net_pnl / risk
+
         results.append({
-            "time": df.index[i],
+            "signal_time": df.index[i],
+            "entry_time": df.index[i + 1],
+            "exit_time": df.index[exit_index],
             "model": model,
             "direction": direction,
+            "rr_target": rr,
             "entry": entry,
             "sl": sl,
             "tp": tp,
-            "rr": MIN_RR,
-            "outcome": outcome,
             "exit_price": exit_price,
-            "exit_time": df.index[exit_index]
+            "outcome": outcome,
+            "gross_pnl": gross_pnl,
+            "estimated_cost": total_cost,
+            "net_pnl": net_pnl,
+            "net_r": net_r
         })
 
-        # Avoid overlapping positions in this first test.
-        if exit_index > i + 1:
-            pass
+        # Next trade only after this trade exits.
+        next_allowed_index = exit_index + 1
 
     return results
 
 
+def calculate_metrics(group):
+    if group.empty:
+        return None
+
+    total = len(group)
+
+    tp_hits = (group["outcome"] == "TP").sum()
+    sl_hits = (group["outcome"] == "LOSS").sum()
+    timeouts = (group["outcome"] == "TIMEOUT").sum()
+
+    # Positive net outcome, including profitable timeouts.
+    profitable = (group["net_pnl"] > 0).sum()
+
+    gross_profit = group.loc[
+        group["net_pnl"] > 0, "net_pnl"
+    ].sum()
+
+    gross_loss = abs(
+        group.loc[
+            group["net_pnl"] < 0, "net_pnl"
+        ].sum()
+    )
+
+    profit_factor = (
+        gross_profit / gross_loss
+        if gross_loss > 0 else np.inf
+    )
+
+    equity_r = group["net_r"].cumsum()
+    drawdown = equity_r - equity_r.cummax()
+
+    return {
+        "trades": total,
+        "TP_hits": int(tp_hits),
+        "SL_hits": int(sl_hits),
+        "timeouts": int(timeouts),
+        "TP_hit_rate_pct": round(tp_hits / total * 100, 2),
+        "profitable_rate_pct": round(
+            profitable / total * 100, 2
+        ),
+        "average_net_R": round(
+            group["net_r"].mean(), 3
+        ),
+        "profit_factor": round(
+            profit_factor, 3
+        ) if np.isfinite(profit_factor) else "Inf",
+        "max_drawdown_R": round(
+            abs(drawdown.min()), 3
+        )
+    }
+
+
+def create_report(results, data):
+    if results.empty:
+        print("No trades found.")
+        return
+
+    split_index = int(len(data) * 0.70)
+    split_time = data.index[split_index]
+
+    results["sample"] = np.where(
+        results["signal_time"] < split_time,
+        "IN_SAMPLE",
+        "OUT_OF_SAMPLE"
+    )
+
+    results.to_csv(
+        OUTPUT_DIR / "all_trades.csv",
+        index=False
+    )
+
+    reports = []
+
+    for sample in ["IN_SAMPLE", "OUT_OF_SAMPLE"]:
+        subset = results[results["sample"] == sample]
+
+        for model in sorted(subset["model"].unique()):
+            for direction in ["BUY", "SELL"]:
+                for rr in RR_LEVELS:
+
+                    group = subset[
+                        (subset["model"] == model) &
+                        (subset["direction"] == direction) &
+                        (subset["rr_target"] == rr)
+                    ]
+
+                    metrics = calculate_metrics(group)
+
+                    if metrics is None:
+                        continue
+
+                    reports.append({
+                        "sample": sample,
+                        "model": model,
+                        "direction": direction,
+                        "target_RR": rr,
+                        **metrics
+                    })
+
+    report = pd.DataFrame(reports)
+
+    report.to_csv(
+        OUTPUT_DIR / "performance_report.csv",
+        index=False
+    )
+
+    print("\n========== PERFORMANCE REPORT ==========")
+
+    if not report.empty:
+        print(
+            report.to_string(index=False)
+        )
+
+    print("\nFiles saved in:", OUTPUT_DIR)
+
+
 def main():
-    print("RLA Research Engine V1 started.")
+    print("RLA Research Engine V2 started.")
 
     data = download_data()
     data = calculate_indicators(data)
@@ -274,68 +440,41 @@ def main():
 
     for model in models:
         for direction in ["BUY", "SELL"]:
-            trades = backtest_model(
-                data, model, direction
-            )
-            all_results.extend(trades)
+            for rr in RR_LEVELS:
+
+                print(
+                    f"Testing {model} {direction} "
+                    f"at 1:{rr}"
+                )
+
+                trades = backtest_model(
+                    data,
+                    model,
+                    direction,
+                    rr
+                )
+
+                all_results.extend(trades)
 
     if not all_results:
-        print("No historical setups found.")
+        print("No historical trades found.")
         return
 
     results = pd.DataFrame(all_results)
 
-    # Chronological out-of-sample split.
-    split_time = data.index[int(len(data) * 0.70)]
-
-    in_sample = results[results["time"] < split_time]
-    out_sample = results[results["time"] >= split_time]
-
-    results.to_csv(
-        OUTPUT_DIR / "all_trades.csv",
-        index=False
-    )
-
-    def report(group, title):
-        print("\n", title)
-        print("-" * 45)
-
-        if group.empty:
-            print("No trades.")
-            return
-
-        for model in models:
-            subset = group[group["model"] == model]
-            if subset.empty:
-                continue
-
-            wins = (subset["outcome"] == "WIN").sum()
-            losses = (subset["outcome"] == "LOSS").sum()
-            total = wins + losses
-
-            win_rate = (
-                wins / total * 100 if total else 0
-            )
-
-            print(
-                f"{model}: "
-                f"Trades={len(subset)}, "
-                f"Wins={wins}, "
-                f"Losses={losses}, "
-                f"Timeouts={len(subset) - total}, "
-                f"Win Rate={win_rate:.2f}%"
-            )
-
-    report(in_sample, "IN-SAMPLE RESULTS")
-    report(out_sample, "OUT-OF-SAMPLE RESULTS")
+    create_report(results, data)
 
     print("\nResearch completed.")
     print("Symbol:", SYMBOL)
-    print("Data:", INTERVAL, PERIOD)
-    print("Minimum RR:", MIN_RR)
-    print("Important: Costs and broker-feed differences")
-    print("are not yet included.")
-    print("This is NOT a production trading signal.")
+    print("Interval:", INTERVAL)
+    print("Period:", PERIOD)
+    print("RR levels:", RR_LEVELS)
+
+    print("\nIMPORTANT:")
+    print("GC=F is not FundingPips MT5 XAUUSD.")
+    print("Costs are estimates configured by the user.")
+    print("No live signals are generated.")
+    print("This is a preliminary research engine.")
 
 
 if __name__ == "__main__":
