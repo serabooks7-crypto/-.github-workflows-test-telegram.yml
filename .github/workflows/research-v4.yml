@@ -43,6 +43,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: RLA-V4-Research-Reports
-          path: output/
+          path: path: research_v4_output/
           if-no-files-found: warn
           retention-days: 30
