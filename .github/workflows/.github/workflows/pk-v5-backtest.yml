@@ -1,0 +1,38 @@
+
+name: PK V5 Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pandas numpy
+
+      - name: Run PK V5 Backtest
+        run: python pk_v5_backtest.py
+
+      - name: Upload Backtest Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PK-V5-Backtest-Results
+          path: pk_backtest_results/
+          if-no-files-found: warn
