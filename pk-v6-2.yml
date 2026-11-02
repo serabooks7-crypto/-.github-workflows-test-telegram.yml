@@ -4,30 +4,19 @@ on:
   schedule:
     - cron: "*/5 * * * *"
 permissions:
-  contents: write
-concurrency:
-  group: pk-v6-2-signals
-  cancel-in-progress: false
+  contents: read
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: pip install -r pk_v6_2_requirements.txt
-      - name: Run V6.2
+      - name: Run PK BOT V6.2
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python pk_v6_2.py
-      - name: Persist duplicate alert state
-        run: |
-          if [ -f pk_v6_2_state.json ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add pk_v6_2_state.json
-            git diff --cached --quiet || (git commit -m "Update V6.2 alert state" && git push)
-          fi
