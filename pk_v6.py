@@ -7,18 +7,15 @@ import pandas as pd
 import yfinance as yf
 from datetime import datetime, timezone
 
-# =========================================================
-# PK V6 — FREE MULTI-TIMEFRAME SIGNAL ENGINE
-# =========================================================
+# ================= CONFIGURATION =================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-TIMEFRAMES = ["15m", "30m", "1h", "4h", "1d"]
-SYMBOLS = {
-    "BTCUSD": "BTCUSDT",
-    "XAUUSD": "GC=F"
-}
+SYMBOLS = {"BTCUSD": "BTCUSDT", "XAUUSD": "GC=F"}
+
+TIMEFRAMES = ["5m", "15m", "30m", "1h", "4h", "1d"]
+BIAS_TIMEFRAMES = ["1h", "4h"]
 
 EMA_FAST = 20
 EMA_MID = 50
@@ -33,15 +30,19 @@ RVI_LEVEL = 0.500
 
 ATR_PERIOD = 14
 RR_MIN = 4.0
-SWING_LOOKBACK = 10
+SWING_LOOKBACK = 20
 PIVOT_WINDOW = 3
+ARM_LOOKBACK = 50
+
+# Buffer around opposing liquidity, expressed in ATR
+LIQUIDITY_BUFFER_ATR = 0.15
 
 BINANCE_URL = "https://fapi.binance.com"
-YAHOO_PERIOD = "60d"
+INTRADAY_PERIOD = "60d"
+DAILY_PERIOD = "2y"
 
-# =========================================================
-# TELEGRAM
-# =========================================================
+
+# ================= TELEGRAM =================
 
 def telegram_send(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -60,6 +61,7 @@ def telegram_send(message):
             },
             timeout=20
         )
+        response.raise_for_status()
         result = response.json()
         print("Telegram:", result.get("ok"), result.get("description", ""))
         return bool(result.get("ok"))
@@ -68,25 +70,17 @@ def telegram_send(message):
         return False
 
 
-# =========================================================
-# DATA COLLECTION
-# =========================================================
+# ================= DATA FETCHING =================
 
 def fetch_binance(symbol, interval, limit=1000):
     url = f"{BINANCE_URL}/fapi/v1/klines"
 
     response = requests.get(
         url,
-        params={
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit
-        },
+        params={"symbol": symbol, "interval": interval, "limit": limit},
         timeout=25
     )
     response.raise_for_status()
-
-    rows = response.json()
 
     columns = [
         "time", "open", "high", "low", "close", "volume",
@@ -94,17 +88,21 @@ def fetch_binance(symbol, interval, limit=1000):
         "taker_buy_base", "taker_buy_quote", "ignore"
     ]
 
-    df = pd.DataFrame(rows, columns=columns)
+    df = pd.DataFrame(response.json(), columns=columns)
 
     df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
 
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df[["time", "open", "high", "low", "close", "volume"]]
-    df = df.dropna().set_index("time").sort_index()
+    df = (
+        df[["time", "open", "high", "low", "close", "volume"]]
+        .dropna()
+        .set_index("time")
+        .sort_index()
+    )
 
-    # Remove unfinished candle
+    # Remove currently forming candle
     if len(df) > 1:
         df = df.iloc[:-1]
 
@@ -112,24 +110,21 @@ def fetch_binance(symbol, interval, limit=1000):
 
 
 def fetch_yahoo(interval):
-    yahoo_interval = interval
+    period = DAILY_PERIOD if interval == "1d" else INTRADAY_PERIOD
 
-    # Yahoo does not reliably provide native 4h candles.
-    if interval == "4h":
-        source_interval = "1h"
-    else:
-        source_interval = interval
+    # Yahoo does not provide native 4h bars reliably.
+    source_interval = "1h" if interval == "4h" else interval
 
     data = yf.download(
         "GC=F",
-        period=YAHOO_PERIOD,
+        period=period,
         interval=source_interval,
         progress=False,
         auto_adjust=False
     )
 
     if data is None or data.empty:
-        raise ValueError("Yahoo returned no data")
+        raise ValueError(f"Yahoo returned no data for {interval}")
 
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
@@ -142,8 +137,11 @@ def fetch_yahoo(interval):
         "Volume": "volume"
     })
 
-    data = data[["open", "high", "low", "close", "volume"]]
-    data = data.dropna()
+    required = ["open", "high", "low", "close", "volume"]
+
+    data = data[required].dropna()
+    data.index = pd.to_datetime(data.index, utc=True)
+    data = data.sort_index()
 
     if interval == "4h":
         data = data.resample("4h").agg({
@@ -153,8 +151,6 @@ def fetch_yahoo(interval):
             "close": "last",
             "volume": "sum"
         }).dropna()
-
-    data.index = pd.to_datetime(data.index, utc=True)
 
     # Remove current unfinished candle
     if len(data) > 1:
@@ -170,9 +166,14 @@ def get_data(symbol, interval):
     return fetch_yahoo(interval)
 
 
-# =========================================================
-# INDICATORS
-# =========================================================
+def get_daily_data(symbol):
+    if symbol == "BTCUSD":
+        return fetch_binance("BTCUSDT", "1d")
+
+    return fetch_yahoo("1d")
+
+
+# ================= INDICATORS =================
 
 def calculate_rsi(close, period=14):
     delta = close.diff()
@@ -202,26 +203,23 @@ def calculate_rsi(close, period=14):
 
 
 def calculate_rvi(df, period=8):
-    # Normalized RVI approximation.
-    # This is NOT guaranteed to match TradingView RVI.
-
     close = df["close"]
     open_ = df["open"]
     high = df["high"]
     low = df["low"]
 
     numerator = (
-        (close - open_) +
-        2 * (close.shift(1) - open_.shift(1)) +
-        2 * (close.shift(2) - open_.shift(2)) +
-        (close.shift(3) - open_.shift(3))
+        (close - open_)
+        + 2 * (close.shift(1) - open_.shift(1))
+        + 2 * (close.shift(2) - open_.shift(2))
+        + (close.shift(3) - open_.shift(3))
     ) / 6
 
     denominator = (
-        (high - low) +
-        2 * (high.shift(1) - low.shift(1)) +
-        2 * (high.shift(2) - low.shift(2)) +
-        (high.shift(3) - low.shift(3))
+        (high - low)
+        + 2 * (high.shift(1) - low.shift(1))
+        + 2 * (high.shift(2) - low.shift(2))
+        + (high.shift(3) - low.shift(3))
     ) / 6
 
     numerator_smooth = numerator.rolling(period).mean()
@@ -233,22 +231,22 @@ def calculate_rvi(df, period=8):
 def add_indicators(df):
     df = df.copy()
 
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-    df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
+    df["ema20"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=EMA_MID, adjust=False).mean()
+    df["ema200"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
 
     df["rsi"] = calculate_rsi(df["close"], RSI_PERIOD)
     df["rvi"] = calculate_rvi(df, RVI_PERIOD)
 
     previous_close = df["close"].shift(1)
 
-    tr = pd.concat([
+    true_range = pd.concat([
         df["high"] - df["low"],
         (df["high"] - previous_close).abs(),
         (df["low"] - previous_close).abs()
     ], axis=1).max(axis=1)
 
-    df["atr"] = tr.ewm(
+    df["atr"] = true_range.ewm(
         alpha=1 / ATR_PERIOD,
         min_periods=ATR_PERIOD,
         adjust=False
@@ -257,9 +255,7 @@ def add_indicators(df):
     return df.dropna()
 
 
-# =========================================================
-# HIGHER TIMEFRAME BIAS
-# =========================================================
+# ================= HTF BIAS =================
 
 def get_bias(symbol):
     try:
@@ -295,115 +291,147 @@ def get_bias(symbol):
         return "UNKNOWN"
 
 
-# =========================================================
-# LIQUIDITY DETECTION
-# =========================================================
+# ================= LIQUIDITY LEVELS =================
 
-def detect_liquidity(df):
-    if len(df) < 30:
+def find_pivots(df):
+    highs = []
+    lows = []
+
+    for i in range(PIVOT_WINDOW, len(df) - PIVOT_WINDOW):
+        high = df["high"].iloc[i]
+        low = df["low"].iloc[i]
+
+        high_window = df["high"].iloc[
+            i - PIVOT_WINDOW:i + PIVOT_WINDOW + 1
+        ]
+
+        low_window = df["low"].iloc[
+            i - PIVOT_WINDOW:i + PIVOT_WINDOW + 1
+        ]
+
+        if high == high_window.max():
+            highs.append(float(high))
+
+        if low == low_window.min():
+            lows.append(float(low))
+
+    return highs, lows
+
+
+def equal_level(values, tolerance):
+    if len(values) < 2:
+        return None
+
+    for i in range(len(values)):
+        for j in range(i + 1, len(values)):
+            if abs(values[i] - values[j]) <= tolerance:
+                return (values[i] + values[j]) / 2
+
+    return None
+
+
+def get_period_levels(symbol):
+    try:
+        daily = get_daily_data(symbol)
+
+        if len(daily) < 3:
+            return {}
+
+        daily = daily.copy()
+
+        pdh = float(daily["high"].iloc[-2])
+        pdl = float(daily["low"].iloc[-2])
+
+        weekly = daily.resample("W").agg({
+            "high": "max",
+            "low": "min"
+        }).dropna()
+
+        pwh = float(weekly["high"].iloc[-2]) if len(weekly) >= 2 else None
+        pwl = float(weekly["low"].iloc[-2]) if len(weekly) >= 2 else None
+
+        return {
+            "PDH": pdh,
+            "PDL": pdl,
+            "PWH": pwh,
+            "PWL": pwl
+        }
+
+    except Exception as exc:
+        print("Daily/weekly liquidity error:", symbol, exc)
         return {}
 
-    recent = df.iloc[-100:].copy()
 
-    highs = recent["high"]
-    lows = recent["low"]
+def detect_liquidity(df, period_levels=None):
+    period_levels = period_levels or {}
+
+    recent = df.iloc[-200:].copy()
 
     current = recent.iloc[-1]
     previous = recent.iloc[-2]
 
-    # Approximate pivot highs/lows
-    pivot_highs = []
-    pivot_lows = []
+    pivot_highs, pivot_lows = find_pivots(recent)
 
-    for i in range(PIVOT_WINDOW, len(recent) - PIVOT_WINDOW):
-        h = highs.iloc[i]
-        l = lows.iloc[i]
-
-        if h == highs.iloc[
-            i-PIVOT_WINDOW:i+PIVOT_WINDOW+1
-        ].max():
-            pivot_highs.append(float(h))
-
-        if l == lows.iloc[
-            i-PIVOT_WINDOW:i+PIVOT_WINDOW+1
-        ].min():
-            pivot_lows.append(float(l))
-
-    atr = float(current.atr) if pd.notna(current.atr) else 0
-
+    atr = float(current.atr)
     tolerance = max(atr * 0.15, float(current.close) * 0.0005)
 
-    def find_equal_levels(values):
-        if len(values) < 2:
-            return None
-
-        for i in range(len(values) - 1):
-            for j in range(i + 1, len(values)):
-                if abs(values[i] - values[j]) <= tolerance:
-                    return round((values[i] + values[j]) / 2, 5)
-
-        return None
-
-    eqh = find_equal_levels(pivot_highs)
-    eql = find_equal_levels(pivot_lows)
+    eqh = equal_level(pivot_highs, tolerance)
+    eql = equal_level(pivot_lows, tolerance)
 
     swing_high = max(pivot_highs) if pivot_highs else None
     swing_low = min(pivot_lows) if pivot_lows else None
 
-    # Previous completed daily/weekly levels from available data
-    daily = recent.resample("1D").agg({
-        "high": "max",
-        "low": "min"
-    }).dropna()
+    # Sweep is checked against the previous candle's available structure.
+    reference_highs = [
+        x for x in pivot_highs
+        if x >= float(previous.high)
+    ]
 
-    weekly = recent.resample("1W").agg({
-        "high": "max",
-        "low": "min"
-    }).dropna()
+    reference_lows = [
+        x for x in pivot_lows
+        if x <= float(previous.low)
+    ]
 
-    pdh = float(daily.iloc[-2]["high"]) if len(daily) >= 2 else None
-    pdl = float(daily.iloc[-2]["low"]) if len(daily) >= 2 else None
+    bullish_sweep = False
+    bearish_sweep = False
 
-    pwh = float(weekly.iloc[-2]["high"]) if len(weekly) >= 2 else None
-    pwl = float(weekly.iloc[-2]["low"]) if len(weekly) >= 2 else None
+    if swing_low is not None:
+        bullish_sweep = (
+            previous.low < swing_low
+            and current.close > swing_low
+        )
 
-    bullish_sweep = (
-        previous.low < (swing_low if swing_low is not None else previous.low)
-        and current.close > previous.low
-    )
+    if swing_high is not None:
+        bearish_sweep = (
+            previous.high > swing_high
+            and current.close < swing_high
+        )
 
-    bearish_sweep = (
-        previous.high > (swing_high if swing_high is not None else previous.high)
-        and current.close < previous.high
-    )
-
-    # Relative volume approximation
     average_volume = recent["volume"].rolling(20).mean().iloc[-1]
 
-    relative_volume = (
-        float(current.volume / average_volume)
-        if pd.notna(average_volume) and average_volume > 0
-        else None
-    )
+    relative_volume = None
 
-    return {
+    if pd.notna(average_volume) and average_volume > 0:
+        relative_volume = float(current.volume / average_volume)
+
+    levels = {
         "EQH": eqh,
         "EQL": eql,
         "Swing High": swing_high,
         "Swing Low": swing_low,
-        "PDH": pdh,
-        "PDL": pdl,
-        "PWH": pwh,
-        "PWL": pwl,
+        "PDH": period_levels.get("PDH"),
+        "PDL": period_levels.get("PDL"),
+        "PWH": period_levels.get("PWH"),
+        "PWL": period_levels.get("PWL"),
         "Bullish Sweep": bool(bullish_sweep),
         "Bearish Sweep": bool(bearish_sweep),
         "Relative Volume": relative_volume
     }
 
+    return levels
 
-# =========================================================
-# SETUP ENGINE
-# =========================================================
+
+# ================= ENTRY MODELS =================
 
 def ema_retest(df, direction):
     if len(df) < 3:
@@ -421,23 +449,60 @@ def ema_retest(df, direction):
     )
 
     if direction == "BUY":
-        # Previous candle touches EMA20.
-        # Current candle body closes above EMA20.
         touched = previous.low <= previous.ema20
-        body_valid = (
+
+        # Retest candle body must remain above EMA20.
+        previous_body_valid = (
+            previous.open > previous.ema20
+            and previous.close > previous.ema20
+        )
+
+        confirmation = (
             current.open > current.ema20
             and current.close > current.ema20
         )
 
-        return bullish_alignment and touched and body_valid
+        return bool(
+            bullish_alignment
+            and touched
+            and previous_body_valid
+            and confirmation
+        )
 
     touched = previous.high >= previous.ema20
-    body_valid = (
+
+    previous_body_valid = (
+        previous.open < previous.ema20
+        and previous.close < previous.ema20
+    )
+
+    confirmation = (
         current.open < current.ema20
         and current.close < current.ema20
     )
 
-    return bearish_alignment and touched and body_valid
+    return bool(
+        bearish_alignment
+        and touched
+        and previous_body_valid
+        and confirmation
+    )
+
+
+def recent_armed(series, threshold, direction):
+    """
+    Require a recent threshold extreme before the latest re-entry.
+    The arming event cannot be an old event from the full history.
+    """
+    if len(series) < 3:
+        return False
+
+    prior = series.iloc[-(ARM_LOOKBACK + 2):-2]
+
+    if direction == "BELOW":
+        return bool((prior < threshold).any())
+
+    return bool((prior > threshold).any())
 
 
 def rsi_reentry(df, direction):
@@ -446,17 +511,22 @@ def rsi_reentry(df, direction):
 
     rsi = df["rsi"]
 
-    # First cross arms the setup.
-    # Return through the threshold creates the entry.
     if direction == "BUY":
-        armed = (rsi.iloc[:-1] < RSI_BUY).any()
-        reentry = rsi.iloc[-2] <= RSI_BUY and rsi.iloc[-1] > RSI_BUY
-        return bool(armed and reentry)
+        armed = recent_armed(rsi, RSI_BUY, "BELOW")
+        crossed_back = (
+            rsi.iloc[-2] <= RSI_BUY
+            and rsi.iloc[-1] > RSI_BUY
+        )
+        return bool(armed and crossed_back)
 
-    armed = (rsi.iloc[:-1] > RSI_SELL).any()
-    reentry = rsi.iloc[-2] >= RSI_SELL and rsi.iloc[-1] < RSI_SELL
+    armed = recent_armed(rsi, RSI_SELL, "ABOVE")
 
-    return bool(armed and reentry)
+    crossed_back = (
+        rsi.iloc[-2] >= RSI_SELL
+        and rsi.iloc[-1] < RSI_SELL
+    )
+
+    return bool(armed and crossed_back)
 
 
 def rvi_reentry(df, direction):
@@ -466,72 +536,147 @@ def rvi_reentry(df, direction):
     rvi = df["rvi"]
 
     if direction == "BUY":
-        armed = (rvi.iloc[:-1] > RVI_LEVEL).any()
-        reentry = (
+        armed = recent_armed(rvi, RVI_LEVEL, "ABOVE")
+
+        crossed_back = (
             rvi.iloc[-2] >= RVI_LEVEL
             and rvi.iloc[-1] < RVI_LEVEL
         )
-        return bool(armed and reentry)
 
-    # User-confirmed SELL Option B:
+        return bool(armed and crossed_back)
+
+    # User-confirmed Option B:
     # First below -0.500, then cross back above -0.500.
-    armed = (rvi.iloc[:-1] < -RVI_LEVEL).any()
-    reentry = (
+    armed = recent_armed(rvi, -RVI_LEVEL, "BELOW")
+
+    crossed_back = (
         rvi.iloc[-2] <= -RVI_LEVEL
         and rvi.iloc[-1] > -RVI_LEVEL
     )
 
-    return bool(armed and reentry)
+    return bool(armed and crossed_back)
 
 
-# =========================================================
-# RISK ENGINE
-# =========================================================
+# ================= OPPOSING LIQUIDITY CHECK =================
 
-def calculate_trade_levels(df, direction):
+def opposing_liquidity_check(entry, direction, sl, liquidity, atr):
+    risk = abs(entry - sl)
+
+    if risk <= 0:
+        return None, "Invalid risk"
+
+    target_distance = RR_MIN * risk
+
+    if direction == "BUY":
+        mathematical_target = entry + target_distance
+        candidate_levels = [
+            liquidity.get("EQH"),
+            liquidity.get("Swing High"),
+            liquidity.get("PDH"),
+            liquidity.get("PWH")
+        ]
+
+        opposing = [
+            float(x) for x in candidate_levels
+            if x is not None and float(x) > entry
+        ]
+
+        if not opposing:
+            return None, "No verified opposing liquidity above entry"
+
+        nearest = min(opposing)
+        buffer = atr * LIQUIDITY_BUFFER_ATR
+        available_target = nearest - buffer
+
+        if available_target < mathematical_target:
+            return None, (
+                f"Opposing liquidity too close: {nearest:.5f}; "
+                f"required target: {mathematical_target:.5f}"
+            )
+
+        return mathematical_target, f"Clear to target; nearest liquidity {nearest:.5f}"
+
+    mathematical_target = entry - target_distance
+
+    candidate_levels = [
+        liquidity.get("EQL"),
+        liquidity.get("Swing Low"),
+        liquidity.get("PDL"),
+        liquidity.get("PWL")
+    ]
+
+    opposing = [
+        float(x) for x in candidate_levels
+        if x is not None and float(x) < entry
+    ]
+
+    if not opposing:
+        return None, "No verified opposing liquidity below entry"
+
+    nearest = max(opposing)
+    buffer = atr * LIQUIDITY_BUFFER_ATR
+    available_target = nearest + buffer
+
+    if available_target > mathematical_target:
+        return None, (
+            f"Opposing liquidity too close: {nearest:.5f}; "
+            f"required target: {mathematical_target:.5f}"
+        )
+
+    return mathematical_target, f"Clear to target; nearest liquidity {nearest:.5f}"
+
+
+# ================= TRADE LEVELS =================
+
+def calculate_trade_levels(df, direction, liquidity):
     current = df.iloc[-1]
 
     entry = float(current.close)
     atr = float(current.atr)
 
     if not np.isfinite(atr) or atr <= 0:
-        return None
+        return None, "Invalid ATR"
 
     recent = df.iloc[-SWING_LOOKBACK:]
 
     if direction == "BUY":
         swing = float(recent["low"].min())
         sl = min(swing, entry - 1.5 * atr)
-        risk = entry - sl
-
-        if risk <= 0:
-            return None
-
-        tp = entry + RR_MIN * risk
 
     else:
         swing = float(recent["high"].max())
         sl = max(swing, entry + 1.5 * atr)
-        risk = sl - entry
 
-        if risk <= 0:
-            return None
+    risk = abs(entry - sl)
 
-        tp = entry - RR_MIN * risk
+    if risk <= 0:
+        return None, "Invalid stop loss"
+
+    target, reason = opposing_liquidity_check(
+        entry, direction, sl, liquidity, atr
+    )
+
+    if target is None:
+        return None, reason
+
+    actual_rr = abs(target - entry) / risk
+
+    if actual_rr < RR_MIN:
+        return None, "Target does not satisfy minimum RR"
 
     return {
         "entry": entry,
         "sl": sl,
-        "tp": tp,
-        "rr": RR_MIN
-    }
+        "tp": target,
+        "rr": actual_rr,
+        "risk": risk,
+        "target_check": reason
+    }, "Valid"
 
 
-# =========================================================
-# SCAN ONE SYMBOL / TIMEFRAME
-# =========================================================
+# ================= SCANNER =================
 
-def scan_one(symbol, timeframe, bias):
+def scan_one(symbol, timeframe, bias, period_levels):
     try:
         raw = get_data(symbol, timeframe)
 
@@ -543,11 +688,10 @@ def scan_one(symbol, timeframe, bias):
         if len(df) < 10:
             return None, "Insufficient indicator history"
 
-        liquidity = detect_liquidity(df)
-
-        setups = []
+        liquidity = detect_liquidity(df, period_levels)
 
         for direction in ["BUY", "SELL"]:
+
             bias_ok = (
                 (direction == "BUY" and bias == "BULLISH")
                 or
@@ -556,6 +700,8 @@ def scan_one(symbol, timeframe, bias):
 
             if not bias_ok:
                 continue
+
+            setups = []
 
             if ema_retest(df, direction):
                 setups.append("EMA20 RETEST")
@@ -566,26 +712,39 @@ def scan_one(symbol, timeframe, bias):
             if rvi_reentry(df, direction):
                 setups.append("RVI RE-CROSS")
 
-            if setups:
-                levels = calculate_trade_levels(df, direction)
+            if not setups:
+                continue
 
-                if levels:
-                    return {
-                        "symbol": symbol,
-                        "timeframe": timeframe,
-                        "direction": direction,
-                        "setups": list(setups),
-                        "levels": levels,
-                        "bias": bias,
-                        "price": float(df.iloc[-1].close),
-                        "rsi": float(df.iloc[-1].rsi),
-                        "rvi": float(df.iloc[-1].rvi),
-                        "ema20": float(df.iloc[-1].ema20),
-                        "ema50": float(df.iloc[-1].ema50),
-                        "ema200": float(df.iloc[-1].ema200),
-                        "liquidity": liquidity,
-                        "data_time": str(df.index[-1])
-                    }, "Signal"
+            levels, reason = calculate_trade_levels(
+                df, direction, liquidity
+            )
+
+            if levels is None:
+                print(
+                    symbol, timeframe, direction,
+                    "Rejected:", reason
+                )
+                continue
+
+            current = df.iloc[-1]
+
+            return {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "direction": direction,
+                "setups": setups,
+                "levels": levels,
+                "bias": bias,
+                "price": float(current.close),
+                "rsi": float(current.rsi),
+                "rvi": float(current.rvi),
+                "ema20": float(current.ema20),
+                "ema50": float(current.ema50),
+                "ema200": float(current.ema200),
+                "atr": float(current.atr),
+                "liquidity": liquidity,
+                "data_time": str(df.index[-1])
+            }, "Signal"
 
         return None, "No confirmed setup"
 
@@ -594,21 +753,21 @@ def scan_one(symbol, timeframe, bias):
         return None, str(exc)
 
 
-# =========================================================
-# TELEGRAM FORMAT
-# =========================================================
+# ================= MESSAGE FORMATTING =================
 
 def format_signal(signal):
     levels = signal["levels"]
     liquidity = signal["liquidity"]
 
-    direction_icon = "🟢" if signal["direction"] == "BUY" else "🔴"
+    icon = "🟢" if signal["direction"] == "BUY" else "🔴"
 
     def show(value):
-        return "N/A" if value is None else f"{value:.5f}"
+        if value is None:
+            return "N/A"
+        return f"{value:.5f}"
 
     return f"""
-{direction_icon} PK V6 SIGNAL
+{icon} PK V6.1 SIGNAL
 
 Symbol: {signal['symbol']}
 Timeframe: {signal['timeframe']}
@@ -617,7 +776,7 @@ Direction: {signal['direction']}
 Entry: {levels['entry']:.5f}
 Stop Loss: {levels['sl']:.5f}
 Take Profit: {levels['tp']:.5f}
-Risk Reward: 1:{levels['rr']:.1f}
+Risk Reward: 1:{levels['rr']:.2f}
 
 SETUPS:
 {chr(10).join('✅ ' + x for x in signal['setups'])}
@@ -630,6 +789,10 @@ EMA200: {signal['ema200']:.5f}
 
 RSI(14): {signal['rsi']:.2f}
 RVI(8): {signal['rvi']:.4f}
+ATR(14): {signal['atr']:.5f}
+
+OPPOSING LIQUIDITY CHECK:
+{levels['target_check']}
 
 LIQUIDITY:
 EQH: {show(liquidity.get('EQH'))}
@@ -647,18 +810,17 @@ Relative Volume: {liquidity.get('Relative Volume')}
 
 Data: {'Binance Futures' if signal['symbol'] == 'BTCUSD' else 'Yahoo GC=F'}
 Mode: Signal only — no auto execution
+CVD: Disabled
 """
 
 
-# =========================================================
-# MAIN
-# =========================================================
+# ================= MAIN =================
 
 def main():
-    print("PK V6 started:", datetime.now(timezone.utc).isoformat())
+    print("PK V6.1 started:", datetime.now(timezone.utc).isoformat())
 
     all_signals = []
-    report = ["PK V6 MARKET SCAN", ""]
+    report = ["PK V6.1 MARKET SCAN", ""]
 
     for symbol in SYMBOLS:
         print("Scanning:", symbol)
@@ -666,13 +828,17 @@ def main():
         bias = get_bias(symbol)
         report.append(f"{symbol} | HTF Bias: {bias}")
 
+        period_levels = get_period_levels(symbol)
+
         if bias in ("UNKNOWN", "NEUTRAL"):
             report.append("No directional bias — entries blocked.")
             report.append("")
             continue
 
         for timeframe in TIMEFRAMES:
-            signal, status = scan_one(symbol, timeframe, bias)
+            signal, status = scan_one(
+                symbol, timeframe, bias, period_levels
+            )
 
             if signal:
                 all_signals.append(signal)
@@ -685,20 +851,18 @@ def main():
 
         report.append("")
 
-    # Send each signal separately
     for signal in all_signals:
         telegram_send(format_signal(signal))
         time.sleep(1)
 
-    # Always send a scan summary
     report.append(f"Signals found: {len(all_signals)}")
+    report.append("Opposing liquidity target check: Enabled")
     report.append("CVD: Disabled")
     report.append("Mode: Signal only")
-    report.append("")
 
     telegram_send("\n".join(report))
 
-    print("PK V6 finished. Signals:", len(all_signals))
+    print("PK V6.1 finished. Signals:", len(all_signals))
 
 
 if __name__ == "__main__":
