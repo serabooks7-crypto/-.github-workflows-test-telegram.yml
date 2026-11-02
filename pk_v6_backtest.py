@@ -1,8 +1,7 @@
 
-import os
 import time
-import warnings
 from pathlib import Path
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -11,621 +10,478 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-# =========================================================
-# PK V6.1 - 90 DAY BACKTEST
-# Separate research file. Does NOT modify the live bot.
-# =========================================================
+# =====================================================
+# PK V6.1 | FIXED 1:4 R:R BACKTEST
+# =====================================================
 
 DAYS = 90
-MARKETS = ["XAUUSD", "BTCUSD"]
-TIMEFRAMES = ["5m", "15m", "30m", "1h", "4h", "1d"]
-
-# XAUUSD: User-provided Exness Standard assumptions
-XAU_SPREAD = 0.30          # Total spread in price units
-XAU_COMMISSION_PER_LOT = 0.0
-XAU_SLIPPAGE_PER_SIDE = 0.05
-
-# BTC: Assumed Binance Futures execution costs.
-# Change these if your actual exchange fees differ.
-BTC_FEE_RATE_PER_SIDE = 0.0005
-BTC_SPREAD_RATE_TOTAL = 0.0
-BTC_SLIPPAGE_RATE_PER_SIDE = 0.0001
-
 MIN_RR = 4.0
-PIVOT_WINDOW = 3
-ARM_LOOKBACK = 50
-INITIAL_EQUITY_R = 0.0
+TIMEFRAMES = ["5m", "15m", "30m", "1h", "4h", "1d"]
+MARKETS = ["XAUUSD", "BTCUSD"]
 
-OUTPUT_DIR = Path("backtest_results")
-OUTPUT_DIR.mkdir(exist_ok=True)
+# User-provided XAUUSD Standard assumptions
+XAU_SPREAD = 0.30
+XAU_SLIPPAGE = 0.05
+
+# Assumed BTC Futures costs; change to actual venue fees
+BTC_FEE = 0.0005
+BTC_SLIPPAGE = 0.0001
+BTC_SPREAD = 0.0
+
+OUT = Path("backtest_results")
+OUT.mkdir(exist_ok=True)
 
 
-# -------------------------
-# DATA DOWNLOAD
-# -------------------------
+# ---------------- DATA ----------------
 
-def binance_klines(interval, days=90):
+def get_btc(interval):
     url = "https://fapi.binance.com/fapi/v1/klines"
-    end_time = int(time.time() * 1000)
-    start_time = end_time - days * 24 * 60 * 60 * 1000
+    end = int(time.time() * 1000)
+    start = end - DAYS * 86400000
+    rows = []
 
-    all_rows = []
-    cursor = start_time
-
-    while cursor < end_time:
-        params = {
+    while start < end:
+        r = requests.get(url, params={
             "symbol": "BTCUSDT",
             "interval": interval,
-            "startTime": cursor,
-            "endTime": end_time,
-            "limit": 1000,
-        }
+            "startTime": start,
+            "endTime": end,
+            "limit": 1000
+        }, timeout=30)
+        r.raise_for_status()
+        batch = r.json()
 
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        rows = response.json()
-
-        if not rows:
+        if not batch:
             break
 
-        all_rows.extend(rows)
-        cursor = rows[-1][0] + 1
-
-        if len(rows) < 1000:
+        rows.extend(batch)
+        start = batch[-1][0] + 1
+        if len(batch) < 1000:
             break
+        time.sleep(0.12)
 
-        time.sleep(0.15)
-
-    if not all_rows:
+    if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(all_rows, columns=[
+    d = pd.DataFrame(rows, columns=[
         "time", "Open", "High", "Low", "Close", "Volume",
-        "close_time", "quote_volume", "trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
+        "close_time", "qv", "trades", "tb", "tq", "ignore"
     ])
-
-    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(
-        df["close_time"], unit="ms", utc=True
+    d["time"] = pd.to_datetime(d["time"], unit="ms", utc=True)
+    d["close_time"] = pd.to_datetime(
+        d["close_time"], unit="ms", utc=True
     )
-
-    df = df.set_index("time")
-    df = df[["Open", "High", "Low", "Close", "Volume"]]
-    df = df.astype(float)
-
-    # Exclude candles that have not closed yet.
+    d = d.set_index("time")
+    d = d[["Open", "High", "Low", "Close", "Volume"]].astype(float)
     now = pd.Timestamp.now(tz="UTC")
-    df = df[df.index + pd.Timedelta(milliseconds=1) <= now]
+    d = d[d.index + pd.Timedelta(milliseconds=1) <= now]
+    return d[~d.index.duplicated(keep="last")].sort_index()
 
-    return df[~df.index.duplicated(keep="last")].sort_index()
 
-
-def yahoo_gold(interval):
-    # Yahoo Finance generally limits intraday history.
+def get_gold(interval):
     period = "60d" if interval != "1d" else "2y"
-
-    data = yf.download(
-        "GC=F",
-        period=period,
-        interval=interval,
-        auto_adjust=False,
-        progress=False,
-        threads=False,
+    d = yf.download(
+        "GC=F", period=period, interval=interval,
+        auto_adjust=False, progress=False, threads=False
     )
-
-    if data.empty:
+    if d.empty:
         return pd.DataFrame()
 
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
+    if isinstance(d.columns, pd.MultiIndex):
+        d.columns = d.columns.get_level_values(0)
 
-    data = data.rename(columns={
-        "Open": "Open",
-        "High": "High",
-        "Low": "Low",
-        "Close": "Close",
-        "Volume": "Volume",
-    })
-
-    required = ["Open", "High", "Low", "Close", "Volume"]
-    data = data[required].dropna(subset=["Open", "High", "Low", "Close"])
-
-    idx = pd.to_datetime(data.index)
-
+    d = d[["Open", "High", "Low", "Close", "Volume"]]
+    idx = pd.to_datetime(d.index)
     if idx.tz is None:
         idx = idx.tz_localize("UTC")
     else:
         idx = idx.tz_convert("UTC")
+    d.index = idx
+    d = d.dropna(subset=["Open", "High", "Low", "Close"])
+    d = d[~d.index.duplicated(keep="last")].sort_index()
 
-    data.index = idx
-    data = data[~data.index.duplicated(keep="last")].sort_index()
+    # Apply the 90-day cutoff to DAILY data too.
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=DAYS)
+    d = d[d.index >= cutoff]
 
-    # Remove the currently forming candle.
+    # Exclude currently forming candle.
     duration = pd.Timedelta(interval)
-    now = pd.Timestamp.now(tz="UTC")
-    data = data[data.index + duration <= now]
-
-    return data.astype(float)
+    d = d[d.index + duration <= pd.Timestamp.now(tz="UTC")]
+    return d.astype(float)
 
 
-def resample_ohlcv(df, rule):
-    if df.empty:
-        return df.copy()
-
-    result = df.resample(rule, label="left", closed="left").agg({
+def resample_data(d, rule):
+    if d.empty:
+        return d
+    return d.resample(rule, label="left", closed="left").agg({
         "Open": "first",
         "High": "max",
         "Low": "min",
         "Close": "last",
-        "Volume": "sum",
-    })
-
-    return result.dropna(subset=["Open", "High", "Low", "Close"])
+        "Volume": "sum"
+    }).dropna(subset=["Open", "High", "Low", "Close"])
 
 
-def load_market_data(market):
+def load_market(market):
     result = {}
-
     if market == "BTCUSD":
-        mapping = {
-            "5m": "5m",
-            "15m": "15m",
-            "30m": "30m",
-            "1h": "1h",
-            "4h": "4h",
-            "1d": "1d",
-        }
-
-        for tf, interval in mapping.items():
-            print(f"Downloading BTC {tf}...")
-            result[tf] = binance_klines(interval, DAYS)
-
+        for tf in TIMEFRAMES:
+            result[tf] = get_btc(tf)
     else:
-        mapping = {
-            "5m": "5m",
-            "15m": "15m",
-            "30m": "30m",
-            "1h": "60m",
-            "4h": "60m",
-            "1d": "1d",
-        }
-
-        for tf, interval in mapping.items():
-            print(f"Downloading Gold {tf}...")
-            data = yahoo_gold(interval)
-
-            if tf == "4h":
-                data = resample_ohlcv(data, "4h")
-
-            result[tf] = data
-
+        for tf in ["5m", "15m", "30m", "1h", "1d"]:
+            interval = "60m" if tf == "1h" else tf
+            result[tf] = get_gold(interval)
+        # Gold 4H is built from hourly candles.
+        result["4h"] = resample_data(result["1h"], "4h")
     return result
 
 
-# -------------------------
-# INDICATORS
-# -------------------------
+# ---------------- INDICATORS ----------------
 
-def add_indicators(df):
-    df = df.copy()
+def indicators(d):
+    d = d.copy()
 
-    for period in [20, 50, 200]:
-        df[f"EMA{period}"] = df["Close"].ewm(
-            span=period, adjust=False
+    for n in [20, 50, 200]:
+        d[f"EMA{n}"] = d.Close.ewm(
+            span=n, adjust=False
         ).mean()
 
-    delta = df["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    change = d.Close.diff()
+    gain = change.clip(lower=0)
+    loss = -change.clip(upper=0)
+    ag = gain.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    al = loss.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    rs = ag / al.replace(0, np.nan)
+    d["RSI"] = 100 - 100 / (1 + rs)
 
-    avg_gain = gain.ewm(
-        alpha=1 / 14, adjust=False, min_periods=14
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / 14, adjust=False, min_periods=14
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["RSI"] = 100 - (100 / (1 + rs))
-
-    # Approximate RVI(8), normalized around zero.
-    num = (df["Close"] - df["Open"]).rolling(8).mean()
-    den = (df["High"] - df["Low"]).rolling(8).mean()
-    df["RVI"] = num / den.replace(0, np.nan)
-
-    return df
+    d["RVI"] = (
+        (d.Close - d.Open).rolling(8).mean()
+        / (d.High - d.Low).rolling(8).mean().replace(0, np.nan)
+    )
+    return d
 
 
-# -------------------------
-# HTF BIAS - NO LOOKAHEAD
-# -------------------------
+# ---------------- HTF BIAS ----------------
 
-def closed_htf_row(htf, timestamp, timeframe):
-    if htf.empty:
+def htf_row(d, timestamp, duration):
+    if d.empty:
         return None
-
-    duration = pd.Timedelta(timeframe)
-
-    # Candle is usable only after its closing time.
-    available = htf.loc[
-        htf.index + duration <= timestamp
-    ]
-
-    if available.empty:
+    # Only candles whose closing time is at or before timestamp.
+    valid = d[d.index + duration <= timestamp]
+    if valid.empty:
         return None
+    return valid.iloc[-1]
 
-    return available.iloc[-1]
 
+def bias_at(h1, h4, signal_close):
+    a = htf_row(h1, signal_close, pd.Timedelta("1h"))
+    b = htf_row(h4, signal_close, pd.Timedelta("4h"))
 
-def get_htf_bias(h1, h4, timestamp):
-    row1 = closed_htf_row(h1, timestamp, "1h")
-    row4 = closed_htf_row(h4, timestamp, "4h")
-
-    if row1 is None or row4 is None:
+    if a is None or b is None:
         return "UNKNOWN"
 
-    bullish1 = (
-        row1["EMA20"] > row1["EMA50"] > row1["EMA200"]
+    bull = (
+        a.EMA20 > a.EMA50 > a.EMA200
+        and b.EMA20 > b.EMA50 > b.EMA200
     )
-    bullish4 = (
-        row4["EMA20"] > row4["EMA50"] > row4["EMA200"]
-    )
-
-    bearish1 = (
-        row1["EMA20"] < row1["EMA50"] < row1["EMA200"]
-    )
-    bearish4 = (
-        row4["EMA20"] < row4["EMA50"] < row4["EMA200"]
+    bear = (
+        a.EMA20 < a.EMA50 < a.EMA200
+        and b.EMA20 < b.EMA50 < b.EMA200
     )
 
-    if bullish1 and bullish4:
+    if bull:
         return "BULLISH"
-
-    if bearish1 and bearish4:
+    if bear:
         return "BEARISH"
-
     return "UNKNOWN"
 
 
-# -------------------------
-# LIQUIDITY ESTIMATION
-# -------------------------
+# ---------------- LIQUIDITY ----------------
 
-def liquidity_levels(history):
+def liquidity(history):
     levels = []
+    h = history.High.to_numpy()
+    l = history.Low.to_numpy()
 
-    if len(history) < 30:
-        return levels
+    # Only confirmed pivots; right-side candles are already closed.
+    for i in range(3, len(history) - 3):
+        if h[i] == max(h[i-3:i+4]):
+            levels.append(("HIGH", float(h[i])))
+        if l[i] == min(l[i-3:i+4]):
+            levels.append(("LOW", float(l[i])))
 
-    # Confirmed swing highs and lows.
-    highs = history["High"].to_numpy()
-    lows = history["Low"].to_numpy()
-
-    for i in range(PIVOT_WINDOW, len(history) - PIVOT_WINDOW):
-        if highs[i] == max(
-            highs[i - PIVOT_WINDOW:i + PIVOT_WINDOW + 1]
-        ):
-            levels.append(("HIGH", float(highs[i])))
-
-        if lows[i] == min(
-            lows[i - PIVOT_WINDOW:i + PIVOT_WINDOW + 1]
-        ):
-            levels.append(("LOW", float(lows[i])))
-
-    # Previous completed daily and weekly levels.
-    daily = resample_ohlcv(history, "1D")
-    weekly = resample_ohlcv(history, "1W")
+    daily = resample_data(history, "1D")
+    weekly = resample_data(history, "1W")
 
     if len(daily) >= 2:
-        levels.append(("HIGH", float(daily["High"].iloc[-2])))
-        levels.append(("LOW", float(daily["Low"].iloc[-2])))
+        levels += [
+            ("HIGH", float(daily.High.iloc[-2])),
+            ("LOW", float(daily.Low.iloc[-2]))
+        ]
 
     if len(weekly) >= 2:
-        levels.append(("HIGH", float(weekly["High"].iloc[-2])))
-        levels.append(("LOW", float(weekly["Low"].iloc[-2])))
+        levels += [
+            ("HIGH", float(weekly.High.iloc[-2])),
+            ("LOW", float(weekly.Low.iloc[-2]))
+        ]
 
     return levels
 
 
-def nearest_target(levels, direction, entry):
-    candidates = []
+# ---------------- SIGNAL ----------------
 
-    for kind, price in levels:
-        if direction == "BUY" and kind == "HIGH" and price > entry:
-            candidates.append(price)
-
-        if direction == "SELL" and kind == "LOW" and price < entry:
-            candidates.append(price)
-
-    if not candidates:
+def find_signal(hist, bias, diag):
+    if len(hist) < 220:
+        diag["insufficient_history"] += 1
         return None
 
-    return min(candidates) if direction == "BUY" else max(candidates)
-
-
-# -------------------------
-# SIGNAL MODEL
-# -------------------------
-
-def signal_at(history, bias):
-    if len(history) < 220:
-        return None
-
-    prev = history.iloc[-2]
-    cur = history.iloc[-1]
+    p = hist.iloc[-2]
+    c = hist.iloc[-1]
 
     if bias == "UNKNOWN":
+        diag["unknown_bias"] += 1
         return None
 
-    direction = "BUY" if bias == "BULLISH" else "SELL"
-
-    # EMA20 retest. Candle body must not close across EMA20.
-    if direction == "BUY":
-        ema_retest = (
-            cur["Low"] <= cur["EMA20"]
-            and cur["Close"] > cur["EMA20"]
-        )
-        ema_alignment = (
-            cur["EMA20"] > cur["EMA50"] > cur["EMA200"]
-        )
-    else:
-        ema_retest = (
-            cur["High"] >= cur["EMA20"]
-            and cur["Close"] < cur["EMA20"]
-        )
-        ema_alignment = (
-            cur["EMA20"] < cur["EMA50"] < cur["EMA200"]
-        )
-
-    if not ema_retest or not ema_alignment:
-        return None
-
-    rsi_history = history["RSI"].iloc[-(ARM_LOOKBACK + 1):-1]
-    rvi_history = history["RVI"].iloc[-(ARM_LOOKBACK + 1):-1]
-
-    if direction == "BUY":
-        rsi_armed = (rsi_history < 10).any()
-        rsi_trigger = prev["RSI"] <= 10 and cur["RSI"] > 10
-
-        rvi_armed = (rvi_history > 0.5).any()
-        rvi_trigger = prev["RVI"] >= 0.5 and cur["RVI"] < 0.5
-
-    else:
-        rsi_armed = (rsi_history > 90).any()
-        rsi_trigger = prev["RSI"] >= 90 and cur["RSI"] < 90
-
-        rvi_armed = (rvi_history < -0.5).any()
-        rvi_trigger = prev["RVI"] <= -0.5 and cur["RVI"] > -0.5
-
-    if not (rsi_armed and rsi_trigger and rvi_armed and rvi_trigger):
-        return None
-
-    return direction
-
-
-# -------------------------
-# EXECUTION COSTS
-# -------------------------
-
-def fill_price(market, price, side, is_entry):
-    if market == "XAUUSD":
-        half_spread = XAU_SPREAD / 2
-        slip = XAU_SLIPPAGE_PER_SIDE
-
-        if side == "BUY":
-            adjustment = half_spread + slip
-            return price + adjustment if is_entry else price - adjustment
-
-        adjustment = half_spread + slip
-        return price - adjustment if is_entry else price + adjustment
-
-    spread = price * BTC_SPREAD_RATE_TOTAL / 2
-    slip = price * BTC_SLIPPAGE_RATE_PER_SIDE
+    side = "BUY" if bias == "BULLISH" else "SELL"
 
     if side == "BUY":
-        adjustment = spread + slip
-        return price + adjustment if is_entry else price - adjustment
+        ema_ok = (
+            c.Low <= c.EMA20 and c.Close > c.EMA20
+            and c.EMA20 > c.EMA50 > c.EMA200
+        )
+        rsi_armed = (hist.RSI.iloc[-51:-1] < 10).any()
+        rsi_ok = p.RSI <= 10 and c.RSI > 10
+        rvi_armed = (hist.RVI.iloc[-51:-1] > 0.5).any()
+        rvi_ok = p.RVI >= 0.5 and c.RVI < 0.5
+    else:
+        ema_ok = (
+            c.High >= c.EMA20 and c.Close < c.EMA20
+            and c.EMA20 < c.EMA50 < c.EMA200
+        )
+        rsi_armed = (hist.RSI.iloc[-51:-1] > 90).any()
+        rsi_ok = p.RSI >= 90 and c.RSI < 90
+        rvi_armed = (hist.RVI.iloc[-51:-1] < -0.5).any()
+        rvi_ok = p.RVI <= -0.5 and c.RVI > -0.5
 
-    adjustment = spread + slip
-    return price - adjustment if is_entry else price + adjustment
+    if not ema_ok:
+        diag["ema_retest_fail"] += 1
+        return None
+    if not (rsi_armed and rsi_ok):
+        diag["rsi_fail"] += 1
+        return None
+    if not (rvi_armed and rvi_ok):
+        diag["rvi_fail"] += 1
+        return None
+
+    diag["signals_passed"] += 1
+    return side
 
 
-# -------------------------
-# BACKTEST ENGINE
-# -------------------------
+# ---------------- COSTS ----------------
 
-def simulate(market, timeframe, df, h1, h4):
+def entry_fill(market, price, side):
+    if market == "XAUUSD":
+        cost = XAU_SPREAD / 2 + XAU_SLIPPAGE
+    else:
+        cost = price * (BTC_SPREAD / 2 + BTC_SLIPPAGE)
+
+    return price + cost if side == "BUY" else price - cost
+
+
+def exit_fill(market, price, side):
+    if market == "XAUUSD":
+        cost = XAU_SPREAD / 2 + XAU_SLIPPAGE
+    else:
+        cost = price * (BTC_SPREAD / 2 + BTC_SLIPPAGE)
+
+    return price - cost if side == "BUY" else price + cost
+
+
+# ---------------- BACKTEST ----------------
+
+def run_test(market, tf, raw, h1, h4):
     trades = []
+    diag = {
+        "unknown_bias": 0,
+        "insufficient_history": 0,
+        "ema_retest_fail": 0,
+        "rsi_fail": 0,
+        "rvi_fail": 0,
+        "signals_passed": 0,
+        "liquidity_fail": 0,
+        "rr_fail": 0
+    }
 
-    if df.empty or len(df) < 250:
-        return trades
+    if raw.empty or len(raw) < 250:
+        return trades, diag
 
-    df = add_indicators(df)
-    h1 = add_indicators(h1) if not h1.empty else h1
-    h4 = add_indicators(h4) if not h4.empty else h4
+    d = indicators(raw)
+    h1 = indicators(h1) if not h1.empty else h1
+    h4 = indicators(h4) if not h4.empty else h4
 
     position = None
 
-    for i in range(220, len(df) - 1):
-        timestamp = df.index[i]
-        candle = df.iloc[i]
+    for i in range(220, len(d) - 1):
+        bar = d.iloc[i]
+        ts = d.index[i]
+        candle_duration = pd.Timedelta(tf)
+        signal_close = ts + candle_duration
 
+        # Manage an existing position first.
         if position is not None:
-            # Evaluate the candle after entry.
-            bar = candle
+            side = position["side"]
             exit_price = None
             reason = None
 
-            if position["side"] == "BUY":
-                # Gap-aware stop/target execution.
-                if bar["Open"] <= position["sl"]:
-                    exit_price = bar["Open"]
-                    reason = "SL_GAP"
-                elif bar["Open"] >= position["tp"]:
-                    exit_price = position["tp"]
-                    reason = "TP_GAP"
-                elif bar["Low"] <= position["sl"]:
-                    exit_price = position["sl"]
-                    reason = "SL"
-                elif bar["High"] >= position["tp"]:
-                    exit_price = position["tp"]
-                    reason = "TP"
-
+            if side == "BUY":
+                if bar.Open <= position["sl"]:
+                    exit_price, reason = bar.Open, "SL_GAP"
+                elif bar.Open >= position["tp"]:
+                    exit_price, reason = bar.Open, "TP_GAP"
+                elif bar.Low <= position["sl"]:
+                    exit_price, reason = position["sl"], "SL"
+                elif bar.High >= position["tp"]:
+                    exit_price, reason = position["tp"], "TP"
             else:
-                if bar["Open"] >= position["sl"]:
-                    exit_price = bar["Open"]
-                    reason = "SL_GAP"
-                elif bar["Open"] <= position["tp"]:
-                    exit_price = position["tp"]
-                    reason = "TP_GAP"
-                elif bar["High"] >= position["sl"]:
-                    exit_price = position["sl"]
-                    reason = "SL"
-                elif bar["Low"] <= position["tp"]:
-                    exit_price = position["tp"]
-                    reason = "TP"
+                if bar.Open >= position["sl"]:
+                    exit_price, reason = bar.Open, "SL_GAP"
+                elif bar.Open <= position["tp"]:
+                    exit_price, reason = bar.Open, "TP_GAP"
+                elif bar.High >= position["sl"]:
+                    exit_price, reason = position["sl"], "SL"
+                elif bar.Low <= position["tp"]:
+                    exit_price, reason = position["tp"], "TP"
 
             if exit_price is not None:
-                exit_fill = fill_price(
-                    market, exit_price, position["side"], False
+                fill = exit_fill(market, float(exit_price), side)
+                pnl = (
+                    fill - position["entry"]
+                    if side == "BUY"
+                    else position["entry"] - fill
                 )
-
-                if position["side"] == "BUY":
-                    pnl = exit_fill - position["entry"]
-                else:
-                    pnl = position["entry"] - exit_fill
-
                 net_r = pnl / position["risk"]
 
                 if market == "BTCUSD":
-                    fee_r = (
-                        position["entry"] * BTC_FEE_RATE_PER_SIDE
-                        + exit_fill * BTC_FEE_RATE_PER_SIDE
-                    ) / position["risk"]
-                    net_r -= fee_r
+                    fee = (
+                        position["entry"] + fill
+                    ) * BTC_FEE / position["risk"]
+                    net_r -= fee
 
                 trades.append({
                     "market": market,
-                    "timeframe": timeframe,
-                    "side": position["side"],
+                    "timeframe": tf,
+                    "side": side,
                     "entry_time": position["time"],
-                    "exit_time": timestamp,
+                    "exit_time": ts,
                     "entry": position["entry"],
-                    "exit": exit_fill,
-                    "stop_loss": position["sl"],
-                    "take_profit": position["tp"],
-                    "exit_reason": reason,
-                    "net_R": net_r,
+                    "sl": position["sl"],
+                    "tp": position["tp"],
+                    "planned_RR": MIN_RR,
+                    "actual_net_R": round(net_r, 4),
+                    "exit_reason": reason
                 })
-
                 position = None
-
             continue
 
-        history = df.iloc[:i + 1]
-        bias = get_htf_bias(h1, h4, timestamp)
-        direction = signal_at(history, bias)
+        hist = d.iloc[:i+1]
+        bias = bias_at(h1, h4, signal_close)
+        side = find_signal(hist, bias, diag)
 
-        if direction is None:
+        if side is None:
             continue
 
-        levels = liquidity_levels(history)
-        raw_entry = float(df.iloc[i + 1]["Open"])
+        levels = liquidity(hist)
+        raw_entry = float(d.iloc[i+1].Open)
 
-        if direction == "BUY":
-            swing_lows = [
-                price for kind, price in levels
-                if kind == "LOW" and price < raw_entry
+        if side == "BUY":
+            opposing = [
+                x for kind, x in levels
+                if kind == "HIGH" and x > raw_entry
             ]
-            if not swing_lows:
+            stops = [
+                x for kind, x in levels
+                if kind == "LOW" and x < raw_entry
+            ]
+            if not opposing or not stops:
+                diag["liquidity_fail"] += 1
                 continue
-            sl = max(swing_lows)
+            sl = max(stops)
         else:
-            swing_highs = [
-                price for kind, price in levels
-                if kind == "HIGH" and price > raw_entry
+            opposing = [
+                x for kind, x in levels
+                if kind == "LOW" and x < raw_entry
             ]
-            if not swing_highs:
+            stops = [
+                x for kind, x in levels
+                if kind == "HIGH" and x > raw_entry
+            ]
+            if not opposing or not stops:
+                diag["liquidity_fail"] += 1
                 continue
-            sl = min(swing_highs)
+            sl = min(stops)
 
-        entry = fill_price(market, raw_entry, direction, True)
+        entry = entry_fill(market, raw_entry, side)
         risk = abs(entry - sl)
 
         if risk <= 0:
+            diag["liquidity_fail"] += 1
             continue
 
-        target = nearest_target(levels, direction, raw_entry)
+        # Exact 1:4 target. Liquidity must allow at least 4R.
+        tp = entry + MIN_RR * risk if side == "BUY" else entry - MIN_RR * risk
 
-        if target is None:
-            continue
-
-        reward = (
-            target - raw_entry
-            if direction == "BUY"
-            else raw_entry - target
+        nearest_liquidity = (
+            min(opposing) if side == "BUY" else max(opposing)
         )
 
-        if reward / risk < MIN_RR:
+        if side == "BUY" and nearest_liquidity < tp:
+            diag["rr_fail"] += 1
+            continue
+        if side == "SELL" and nearest_liquidity > tp:
+            diag["rr_fail"] += 1
             continue
 
-        # Target is fixed at the nearest opposing liquidity level.
-        tp = target
-
         position = {
-            "side": direction,
+            "side": side,
             "entry": entry,
             "sl": sl,
             "tp": tp,
             "risk": risk,
-            "time": df.index[i + 1],
+            "time": d.index[i+1]
         }
 
-    return trades
+    return trades, diag
 
 
-# -------------------------
-# REPORTING
-# -------------------------
+# ---------------- REPORT ----------------
 
-def summarize(trades):
+def stats(trades):
     if not trades:
         return {
-            "trades": 0,
-            "wins": 0,
-            "losses": 0,
-            "win_rate_pct": 0,
-            "net_R": 0,
-            "profit_factor_R": 0,
-            "max_drawdown_R": 0,
-            "average_R": 0,
+            "trades": 0, "wins": 0, "losses": 0,
+            "win_rate_pct": None, "net_R": 0,
+            "profit_factor": None, "max_drawdown_R": 0,
+            "average_R": None
         }
 
-    results = np.array([t["net_R"] for t in trades], dtype=float)
-
-    wins = results[results > 0]
-    losses = results[results < 0]
-
-    equity = np.cumsum(results)
-    peaks = np.maximum.accumulate(np.maximum(equity, 0))
-    drawdown = peaks - equity
-
-    gross_profit = wins.sum()
-    gross_loss = abs(losses.sum())
+    r = np.array([x["actual_net_R"] for x in trades])
+    wins = r[r > 0]
+    losses = r[r < 0]
+    equity = np.cumsum(r)
+    peak = np.maximum.accumulate(np.maximum(equity, 0))
+    dd = peak - equity
 
     return {
-        "trades": len(results),
+        "trades": len(r),
         "wins": len(wins),
         "losses": len(losses),
-        "win_rate_pct": round(len(wins) / len(results) * 100, 2),
-        "net_R": round(results.sum(), 3),
-        "profit_factor_R": round(
-            gross_profit / gross_loss, 3
-        ) if gross_loss else None,
-        "max_drawdown_R": round(drawdown.max(), 3),
-        "average_R": round(results.mean(), 3),
+        "win_rate_pct": round(len(wins) / len(r) * 100, 2),
+        "net_R": round(r.sum(), 3),
+        "profit_factor": round(
+            wins.sum() / abs(losses.sum()), 3
+        ) if len(losses) else None,
+        "max_drawdown_R": round(dd.max(), 3),
+        "average_R": round(r.mean(), 3)
     }
 
 
@@ -633,84 +489,79 @@ def main():
     all_trades = []
     summaries = []
     coverage = []
+    diagnostics = []
+    errors = []
 
     for market in MARKETS:
-        print(f"\n========== {market} ==========")
+        print("\nLoading", market)
 
         try:
-            market_data = load_market_data(market)
-        except Exception as exc:
-            print(f"Download failed for {market}: {exc}")
+            data = load_market(market)
+        except Exception as e:
+            errors.append({"market": market, "error": str(e)})
+            print("MARKET DOWNLOAD ERROR:", e)
             continue
 
-        h1 = market_data.get("1h", pd.DataFrame())
-        h4 = market_data.get("4h", pd.DataFrame())
+        h1 = data.get("1h", pd.DataFrame())
+        h4 = data.get("4h", pd.DataFrame())
 
-        for timeframe in TIMEFRAMES:
-            df = market_data.get(timeframe, pd.DataFrame())
+        for tf in TIMEFRAMES:
+            d = data.get(tf, pd.DataFrame())
 
-            actual_days = (
-                (df.index[-1] - df.index[0]).total_seconds() / 86400
-                if len(df) > 1 else 0
+            days = (
+                (d.index[-1] - d.index[0]).total_seconds() / 86400
+                if len(d) > 1 else 0
             )
 
             coverage.append({
                 "market": market,
-                "timeframe": timeframe,
-                "candles": len(df),
-                "actual_days": round(actual_days, 2),
-                "first_candle": str(df.index[0]) if len(df) else "",
-                "last_candle": str(df.index[-1]) if len(df) else "",
+                "timeframe": tf,
+                "candles": len(d),
+                "actual_days": round(days, 2)
             })
 
-            print(
-                f"{market} {timeframe}: "
-                f"{len(df)} candles, {actual_days:.1f} days"
-            )
-
-            if df.empty:
+            if d.empty:
+                errors.append({
+                    "market": market,
+                    "error": f"No data for {tf}"
+                })
                 continue
 
             try:
-                trades = simulate(
-                    market, timeframe, df, h1, h4
+                trades, diag = run_test(market, tf, d, h1, h4)
+                all_trades.extend(trades)
+
+                result = stats(trades)
+                result.update({"market": market, "timeframe": tf})
+                summaries.append(result)
+
+                diag.update({"market": market, "timeframe": tf})
+                diagnostics.append(diag)
+
+                print(
+                    market, tf,
+                    "trades:", result["trades"],
+                    "win rate:", result["win_rate_pct"],
+                    "net R:", result["net_R"]
                 )
-            except Exception as exc:
-                print(f"Simulation error {market} {timeframe}: {exc}")
-                continue
 
-            all_trades.extend(trades)
+            except Exception as e:
+                errors.append({
+                    "market": market,
+                    "timeframe": tf,
+                    "error": str(e)
+                })
+                print("TEST ERROR:", market, tf, e)
 
-            stats = summarize(trades)
-            stats["market"] = market
-            stats["timeframe"] = timeframe
-            summaries.append(stats)
+    pd.DataFrame(all_trades).to_csv(OUT / "trades.csv", index=False)
+    pd.DataFrame(summaries).to_csv(OUT / "summary.csv", index=False)
+    pd.DataFrame(coverage).to_csv(OUT / "data_coverage.csv", index=False)
+    pd.DataFrame(diagnostics).to_csv(OUT / "diagnostics.csv", index=False)
+    pd.DataFrame(errors).to_csv(OUT / "errors.csv", index=False)
 
-            print(
-                f"Trades={stats['trades']} | "
-                f"Win rate={stats['win_rate_pct']}% | "
-                f"Net R={stats['net_R']} | "
-                f"PF={stats['profit_factor_R']}"
-            )
-
-    pd.DataFrame(all_trades).to_csv(
-        OUTPUT_DIR / "trades.csv", index=False
-    )
-
-    pd.DataFrame(summaries).to_csv(
-        OUTPUT_DIR / "summary.csv", index=False
-    )
-
-    pd.DataFrame(coverage).to_csv(
-        OUTPUT_DIR / "data_coverage.csv", index=False
-    )
-
-    print("\n====================================")
-    print("PK V6.1 BACKTEST COMPLETED")
-    print("====================================")
-    print(f"Total closed trades: {len(all_trades)}")
-    print(f"Reports saved in: {OUTPUT_DIR.resolve()}")
-    print("Files: trades.csv, summary.csv, data_coverage.csv")
+    print("\nBACKTEST FINISHED")
+    print("Total closed trades:", len(all_trades))
+    print("Reports:", OUT.resolve())
 
 
 if __name__ == "__main__":
