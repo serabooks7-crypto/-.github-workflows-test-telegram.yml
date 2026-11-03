@@ -1,3 +1,4 @@
+
 name: PK BOT V6.4 - API Test
 
 on:
@@ -48,10 +49,8 @@ jobs:
           data = response.json()
 
           if "values" not in data:
-              raise SystemExit(f"API test failed: {data.get('message', data.get('status'))}")
+              raise SystemExit("API test failed: " + str(data))
 
           print("API CONNECTION: SUCCESS")
-          print("Symbol: EUR/USD")
           print("Candles received:", len(data["values"]))
-          print("Latest candle time:", data["values"][0]["datetime"])
           PY
