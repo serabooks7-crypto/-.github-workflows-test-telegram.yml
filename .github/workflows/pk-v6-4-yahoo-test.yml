@@ -1,0 +1,75 @@
+
+name: PK BOT V6.4 - Yahoo Free Data Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  yahoo-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install libraries
+        run: pip install yfinance pandas
+
+      - name: Test Yahoo Finance
+        run: |
+          python - <<'PY'
+          import yfinance as yf
+          import pandas as pd
+          import time
+
+          symbols = {
+              "EURUSD": "EURUSD=X",
+              "GBPUSD": "GBPUSD=X",
+              "USDJPY": "JPY=X",
+              "XAUUSD": "GC=F",
+              "XAGUSD": "SI=F"
+          }
+
+          intervals = ["15m", "30m", "1h", "1d"]
+
+          print("PK BOT V6.4 - YAHOO DATA TEST")
+          print("No API key required")
+
+          for interval in intervals:
+              print(f"\n--- TIMEFRAME: {interval} ---")
+
+              try:
+                  data = yf.download(
+                      list(symbols.values()),
+                      period="5d" if interval != "1d" else "1mo",
+                      interval=interval,
+                      group_by="ticker",
+                      threads=True,
+                      progress=False,
+                      timeout=20,
+                      auto_adjust=False
+                  )
+
+                  for name, ticker in symbols.items():
+                      try:
+                          df = data[ticker].dropna()
+                          if len(df) >= 2:
+                              print(
+                                  f"PASS: {name} | {interval} | "
+                                  f"Candles: {len(df)} | "
+                                  f"Latest Close: {df['Close'].iloc[-1]}"
+                              )
+                          else:
+                              print(f"FAIL: {name} | {interval} | No data")
+                      except Exception:
+                          print(f"FAIL: {name} | {interval} | Missing symbol")
+
+              except Exception as e:
+                  print(f"TIMEFRAME ERROR: {interval} | {e}")
+
+          print("\n========== TEST COMPLETE ==========")
+          PY
