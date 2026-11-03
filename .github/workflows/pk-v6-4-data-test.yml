@@ -1,0 +1,88 @@
+
+name: PK BOT V6.4 - 30 Instrument Data Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  data-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Test 30 Instruments
+        env:
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          import requests
+
+          key = os.environ.get("TWELVE_DATA_API_KEY")
+          if not key:
+              raise SystemExit("API key secret is missing")
+
+          symbols = [
+              "EUR/USD", "GBP/USD", "USD/JPY",
+              "USD/CHF", "USD/CAD", "AUD/USD",
+              "NZD/USD", "EUR/JPY", "GBP/JPY",
+              "EUR/GBP", "EUR/CHF", "AUD/JPY",
+              "CHF/JPY", "EUR/AUD", "EUR/CAD",
+              "AUD/CAD", "GBP/AUD", "GBP/CAD",
+              "AUD/NZD", "NZD/JPY", "CAD/JPY",
+              "GBP/NZD", "EUR/NZD", "CAD/CHF",
+              "AUD/CHF", "GBP/CHF", "NZD/CAD",
+              "NZD/CHF", "XAU/USD", "XAG/USD"
+          ]
+
+          success = []
+          failed = []
+
+          for i, symbol in enumerate(symbols, 1):
+              try:
+                  response = requests.get(
+                      "https://api.twelvedata.com/time_series",
+                      params={
+                          "symbol": symbol,
+                          "interval": "1day",
+                          "outputsize": 2,
+                          "apikey": key
+                      },
+                      timeout=30
+                  )
+
+                  data = response.json()
+
+                  if response.status_code == 200 and "values" in data:
+                      success.append(symbol)
+                      print(f"PASS: {symbol} | Candles: {len(data['values'])}")
+                  else:
+                      message = data.get("message", "Unknown API error")
+                      failed.append((symbol, message))
+                      print(f"FAIL: {symbol} | {message}")
+
+              except Exception as error:
+                  failed.append((symbol, str(error)))
+                  print(f"ERROR: {symbol} | {error}")
+
+              if i < len(symbols):
+                  time.sleep(8.5)
+
+          print("\n========== FINAL REPORT ==========")
+          print("Total instruments:", len(symbols))
+          print("Successful:", len(success))
+          print("Failed:", len(failed))
+          print("Available symbols:", ", ".join(success))
+          print("Unavailable symbols:", ", ".join(s for s, _ in failed))
+          PY
