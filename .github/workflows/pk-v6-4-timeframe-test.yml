@@ -1,0 +1,116 @@
+
+name: PK BOT V6.4 - 29 Instruments Timeframe Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  timeframe-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Requests
+        run: pip install requests
+
+      - name: Test All Timeframes
+        env:
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          import requests
+
+          API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
+
+          SYMBOLS = [
+              "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
+              "USD/CAD", "AUD/USD", "NZD/USD",
+              "EUR/JPY", "GBP/JPY", "EUR/GBP", "EUR/CHF",
+              "AUD/JPY", "CHF/JPY", "EUR/AUD", "EUR/CAD",
+              "AUD/CAD", "GBP/AUD", "GBP/CAD", "AUD/NZD",
+              "NZD/JPY", "CAD/JPY", "GBP/NZD", "EUR/NZD",
+              "CAD/CHF", "AUD/CHF", "GBP/CHF", "NZD/CAD",
+              "NZD/CHF", "XAU/USD"
+          ]
+
+          TIMEFRAMES = [
+              "15min", "30min", "1h", "2h",
+              "4h", "6h", "8h", "12h", "1day"
+          ]
+
+          if not API_KEY:
+              raise SystemExit("ERROR: API key missing")
+
+          results = []
+          total = len(SYMBOLS) * len(TIMEFRAMES)
+
+          print("PK BOT V6.4 TIMEFRAME TEST")
+          print("Total tests:", total)
+
+          for symbol in SYMBOLS:
+              for interval in TIMEFRAMES:
+                  try:
+                      response = requests.get(
+                          "https://api.twelvedata.com/time_series",
+                          params={
+                              "symbol": symbol,
+                              "interval": interval,
+                              "outputsize": 2,
+                              "apikey": API_KEY
+                          },
+                          timeout=30
+                      )
+
+                      data = response.json()
+
+                      if "values" in data and len(data["values"]) >= 2:
+                          status = "PASS"
+                          detail = "Candles: " + str(len(data["values"]))
+                      else:
+                          status = "FAIL"
+                          detail = data.get(
+                              "message",
+                              data.get("status", "No candle data")
+                          )
+
+                      results.append((symbol, interval, status, detail))
+                      print(f"{status}: {symbol} | {interval} | {detail}")
+
+                  except Exception as error:
+                      results.append((symbol, interval, "FAIL", str(error)))
+                      print(f"FAIL: {symbol} | {interval} | {error}")
+
+                  time.sleep(8.5)
+
+          passed = sum(1 for r in results if r[2] == "PASS")
+          failed = total - passed
+
+          print("\n========== FINAL REPORT ==========")
+          print("Total tests:", total)
+          print("Successful:", passed)
+          print("Failed:", failed)
+
+          print("\n========== FAILED COMBINATIONS ==========")
+          for symbol, interval, status, detail in results:
+              if status == "FAIL":
+                  print(f"{symbol} | {interval} | {detail}")
+
+          print("\n========== TIMEFRAME SUMMARY ==========")
+          for interval in TIMEFRAMES:
+              count = sum(
+                  1 for r in results
+                  if r[1] == interval and r[2] == "PASS"
+              )
+              print(f"{interval}: {count}/{len(SYMBOLS)}")
+
+          PY
