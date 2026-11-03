@@ -1,0 +1,21 @@
+name: PK BOT V6.4
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  v64:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show V6.4 initialization
+        run: |
+          echo "PK BOT V6.4"
+          echo "Workflow initialized successfully."
+          echo "No trading signals will be sent yet."
