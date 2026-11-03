@@ -1,0 +1,55 @@
+name: PK BOT V6.4 - API Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  api-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Test Twelve Data API
+        env:
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+
+          key = os.environ.get("TWELVE_DATA_API_KEY")
+          if not key:
+              raise SystemExit("API key secret is missing")
+
+          response = requests.get(
+              "https://api.twelvedata.com/time_series",
+              params={
+                  "symbol": "EUR/USD",
+                  "interval": "15min",
+                  "outputsize": 5,
+                  "apikey": key
+              },
+              timeout=30
+          )
+
+          data = response.json()
+
+          if "values" not in data:
+              raise SystemExit("API test failed: " + str(data))
+
+          print("API CONNECTION: SUCCESS")
+          print("Candles received:", len(data["values"]))
+          PY
