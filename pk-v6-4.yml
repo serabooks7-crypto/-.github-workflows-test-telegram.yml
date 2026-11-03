@@ -32,6 +32,7 @@ jobs:
           import requests
 
           key = os.environ.get("TWELVE_DATA_API_KEY")
+
           if not key:
               raise SystemExit("API key secret is missing")
 
@@ -49,7 +50,9 @@ jobs:
           data = response.json()
 
           if "values" not in data:
-              raise SystemExit("API test failed: " + str(data))
+              raise SystemExit(
+                  "API test failed: " + str(data)
+              )
 
           print("API CONNECTION: SUCCESS")
           print("Candles received:", len(data["values"]))
