@@ -451,19 +451,27 @@ jobs:
               "BUY TP1 minimum reward-risk 1:4",
               buy_levels is not None
               and abs(buy_levels["RR_TP1"] - 4.0) < 1e-9
+              and abs(buy_levels["TP1"] - 108.96) < 1e-9
           )
 
           check(
               "SELL TP1 minimum reward-risk 1:4",
               sell_levels is not None
               and abs(sell_levels["RR_TP1"] - 4.0) < 1e-9
+              and abs(sell_levels["TP1"] - 91.04) < 1e-9
+          )
+
+          levels_without_tp2 = engine.calculate_trade_levels(
+              "BUY", 100, 2, 98, []
           )
 
           check(
               "TP2 is informational and separate from TP1",
               buy_levels is not None
+              and levels_without_tp2 is not None
               and buy_levels["TP2"] == 110
-              and buy_levels["TP1"] == 109.76
+              and abs(buy_levels["TP1"] - 108.96) < 1e-9
+              and buy_levels["TP1"] == levels_without_tp2["TP1"]
           )
 
           # -----------------------------------------
