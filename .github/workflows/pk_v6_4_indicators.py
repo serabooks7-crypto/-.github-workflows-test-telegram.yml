@@ -1,4 +1,3 @@
-
 """
 PK BOT V6.4
 Indicator Calculation Engine
@@ -145,35 +144,71 @@ def calculate_rsi(df, period=14):
 
 
 # --------------------------------------------------
-# RVI 8 - STANDARD FORMULA
+# RVI 8 + SIGNAL LINE 6 WMA
 # --------------------------------------------------
 
-def weighted_average(series, period=4):
+def weighted_average(series, period=6):
 
-    weights = np.array([1, 2, 2, 1], dtype=float)
+    if period < 1:
+        raise ValueError("WMA period must be positive")
+
+    weights = np.arange(
+        1,
+        period + 1,
+        dtype=float
+    )
+
+    weight_sum = weights.sum()
 
     return series.rolling(
-        period,
+        window=period,
         min_periods=period
     ).apply(
-        lambda x: np.dot(x, weights) / weights.sum(),
+        lambda values: np.dot(
+            values,
+            weights
+        ) / weight_sum,
         raw=True
     )
 
 
-def calculate_rvi(df):
+def calculate_rvi(df, period=8, signal_period=6):
 
-    numerator = df["Close"] - df["Open"]
-    denominator = df["High"] - df["Low"]
+    numerator = (
+        df["Close"] - df["Open"]
+    )
 
-    denominator = denominator.replace(0, np.nan)
+    denominator = (
+        df["High"] - df["Low"]
+    )
 
-    weighted_num = weighted_average(numerator)
-    weighted_den = weighted_average(denominator)
+    denominator = denominator.replace(
+        0,
+        np.nan
+    )
 
-    df["RVI"] = weighted_num / weighted_den
+    # Main RVI: 8-candle rolling averages
+    average_numerator = numerator.rolling(
+        window=period,
+        min_periods=period
+    ).mean()
 
-    df["RVI_SIGNAL"] = weighted_average(df["RVI"])
+    average_denominator = denominator.rolling(
+        window=period,
+        min_periods=period
+    ).mean()
+
+    df["RVI"] = (
+        average_numerator /
+        average_denominator
+    )
+
+    # Signal Line: 6-period WMA
+    # Weights: 1, 2, 3, 4, 5, 6
+    df["RVI_SIGNAL"] = weighted_average(
+        df["RVI"],
+        period=signal_period
+    )
 
     return df
 
@@ -332,10 +367,19 @@ def calculate_indicators(data):
     df = prepare_ohlc(data)
 
     df = calculate_ema(df)
+
     df = calculate_rsi(df, 14)
-    df = calculate_rvi(df)
+
+    df = calculate_rvi(
+        df,
+        period=8,
+        signal_period=6
+    )
+
     df = calculate_atr(df, 14)
+
     df = calculate_adx(df, 14)
+
     df = calculate_pivots(df)
 
     return df
@@ -352,10 +396,15 @@ def initialize():
 
     print("EMA: 20 / 100 / 200")
     print("RSI: 14")
-    print("RVI: 8 + Signal Line")
+
+    print("RVI Main Period: 8")
+    print("RVI Signal Line: 6 WMA")
+    print("RVI WMA Weights: 1, 2, 3, 4, 5, 6")
+
     print("ATR: 14")
     print("ADX: 14")
     print("Pivot: 5 candles")
+
     print("Closed candles only")
     print("1D: EXCLUDED")
 
