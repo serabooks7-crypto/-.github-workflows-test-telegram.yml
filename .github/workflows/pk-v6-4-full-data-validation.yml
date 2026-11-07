@@ -1,5 +1,5 @@
 
-name: PK BOT V6.4 - Full Data Validation
+name: PK BOT V6.4 - Data Integrity Validation
 
 on:
   workflow_dispatch:
@@ -21,12 +21,13 @@ jobs:
       - name: Install Libraries
         run: pip install yfinance pandas numpy
 
-      - name: Validate 14 Instruments and 5 Timeframes
+      - name: Validate Data Integrity
         run: |
           python - <<'PY'
           import sys
-          import yfinance as yf
+          import numpy as np
           import pandas as pd
+          import yfinance as yf
 
           SYMBOLS = {
               "EURUSD": "EURUSD=X",
@@ -51,14 +52,19 @@ jobs:
               "1h": "730d"
           }
 
+          MINIMUM = {
+              "15m": 100,
+              "30m": 100,
+              "1h": 500,
+              "2h": 100,
+              "4h": 100
+          }
+
           REQUIRED = ["Open", "High", "Low", "Close"]
 
           failures = []
           base_pass = 0
-          base_total = len(SYMBOLS) * len(PERIODS)
           resample_pass = 0
-          resample_total = len(SYMBOLS) * 2
-
           hourly_data = {}
 
           def extract(data, ticker):
@@ -69,14 +75,16 @@ jobs:
                   for level in range(data.columns.nlevels):
                       if ticker in data.columns.get_level_values(level):
                           try:
-                              result = data.xs(
+                              out = data.xs(
                                   ticker,
                                   axis=1,
                                   level=level
-                              )
-                              if isinstance(result.columns, pd.MultiIndex):
-                                  result.columns = result.columns.get_level_values(0)
-                              return result.copy()
+                              ).copy()
+
+                              if isinstance(out.columns, pd.MultiIndex):
+                                  out.columns = out.columns.get_level_values(0)
+
+                              return out
                           except Exception:
                               pass
 
@@ -84,9 +92,9 @@ jobs:
 
               return data.copy()
 
-          def remove_open_candles(df, minutes):
+          def clean_data(df, minutes):
               if df.empty:
-                  return df
+                  return pd.DataFrame()
 
               df = df.copy()
 
@@ -95,56 +103,65 @@ jobs:
               else:
                   df.index = df.index.tz_convert("UTC")
 
-              now = pd.Timestamp.now(tz="UTC")
-              candle_close_time = df.index + pd.Timedelta(minutes=minutes)
-
-              return df.loc[candle_close_time <= now].copy()
-
-          def validate_ohlc(df):
-              if df is None or df.empty:
-                  return False, "No data"
-
-              if not all(c in df.columns for c in REQUIRED):
-                  return False, "Missing OHLC columns"
-
-              df = df.copy()
+              df = df.sort_index()
+              df = df[~df.index.duplicated(keep="last")]
 
               for col in REQUIRED:
+                  if col not in df.columns:
+                      return pd.DataFrame()
+
                   df[col] = pd.to_numeric(
                       df[col],
                       errors="coerce"
                   )
 
+              # Remove rows with missing or infinite OHLC values.
+              df = df.replace([np.inf, -np.inf], np.nan)
               df = df.dropna(subset=REQUIRED)
 
+              # Keep only fully closed candles.
+              now = pd.Timestamp.now(tz="UTC")
+              close_time = df.index + pd.Timedelta(minutes=minutes)
+              df = df.loc[close_time <= now].copy()
+
+              return df
+
+          def validate_data(df, timeframe):
               if df.empty:
-                  return False, "No valid OHLC rows"
+                  return False, "No valid candles"
+
+              if len(df) < MINIMUM[timeframe]:
+                  return False, f"Insufficient candles: {len(df)}"
+
+              values = df[REQUIRED].to_numpy(dtype=float)
+
+              if not np.isfinite(values).all():
+                  return False, "NaN or infinite OHLC remains"
 
               invalid = (
                   (df["High"] < df["Low"]) |
                   (df["High"] < df["Open"]) |
                   (df["High"] < df["Close"]) |
                   (df["Low"] > df["Open"]) |
-                  (df["Low"] > df["Close"])
+                  (df["Low"] > df["Close"]) |
+                  (df[REQUIRED] <= 0).any(axis=1)
               )
 
               if invalid.any():
                   return False, f"Invalid OHLC rows: {int(invalid.sum())}"
 
-              if (df[REQUIRED] <= 0).any().any():
-                  return False, "Non-positive price found"
+              latest_close = float(df["Close"].iloc[-1])
 
-              return True, "OHLC valid"
+              if not np.isfinite(latest_close) or latest_close <= 0:
+                  return False, "Invalid latest Close"
 
-          def resample_ohlc(df, hours):
+              return True, "Valid"
+
+          def resample_complete(df, hours):
               if df.empty:
                   return pd.DataFrame()
 
-              df = df.copy()
               df = df.sort_index()
-              df = df[~df.index.duplicated(keep="last")]
-              df = df.dropna(subset=REQUIRED)
-
               rule = f"{hours}h"
 
               aggregation = {
@@ -157,44 +174,71 @@ jobs:
               if "Volume" in df.columns:
                   aggregation["Volume"] = "sum"
 
-              grouped = df.resample(
-                  rule,
-                  origin="start_day",
-                  label="left",
-                  closed="left"
+              now = pd.Timestamp.now(tz="UTC")
+              output = []
+
+              for start, group in df.groupby(
+                  pd.Grouper(
+                      freq=rule,
+                      origin="start_day",
+                      label="left",
+                      closed="left"
+                  )
+              ):
+                  if group.empty:
+                      continue
+
+                  # A complete candle needs every consecutive 1H bar.
+                  expected = pd.date_range(
+                      start=start,
+                      periods=hours,
+                      freq="1h"
+                  )
+
+                  if not group.index.equals(expected):
+                      continue
+
+                  if start + pd.Timedelta(hours=hours) > now:
+                      continue
+
+                  row = {
+                      "Open": group["Open"].iloc[0],
+                      "High": group["High"].max(),
+                      "Low": group["Low"].min(),
+                      "Close": group["Close"].iloc[-1]
+                  }
+
+                  if "Volume" in group.columns:
+                      row["Volume"] = group["Volume"].sum()
+
+                  output.append((start, row))
+
+              if not output:
+                  return pd.DataFrame()
+
+              result = pd.DataFrame(
+                  [item[1] for item in output],
+                  index=[item[0] for item in output]
               )
-
-              result = grouped.agg(aggregation)
-              counts = grouped["Close"].count()
-
-              # Keep only complete 2H or 4H candles.
-              result = result[counts == hours]
-
-              result = result.dropna(subset=REQUIRED)
 
               return result
 
           print("=" * 65)
-          print("PK BOT V6.4 - FULL DATA VALIDATION")
-          print("Active instruments:", len(SYMBOLS))
-          print("Excluded: XAGUSD and 1D")
-          print("Direct timeframes: 15M, 30M, 1H")
-          print("Resampled timeframes: 2H, 4H")
+          print("PK BOT V6.4 - DATA INTEGRITY VALIDATION")
+          print("Instruments:", len(SYMBOLS))
+          print("1D: EXCLUDED")
+          print("Direct: 15M, 30M, 1H")
+          print("Resampled: 2H, 4H")
           print("=" * 65)
 
-          # --------------------------------------------------
-          # PART 1: DIRECT DATA VALIDATION
-          # --------------------------------------------------
-
+          # Direct timeframe tests
           for interval, period in PERIODS.items():
 
-              print(f"\nTIMEFRAME: {interval} | Period: {period}")
-
-              tickers = list(SYMBOLS.values())
+              print(f"\nTIMEFRAME: {interval}")
 
               try:
                   data = yf.download(
-                      tickers=tickers,
+                      tickers=list(SYMBOLS.values()),
                       period=period,
                       interval=interval,
                       group_by="ticker",
@@ -208,30 +252,18 @@ jobs:
                   print("DOWNLOAD ERROR:", str(e))
                   data = pd.DataFrame()
 
+              minutes = {
+                  "15m": 15,
+                  "30m": 30,
+                  "1h": 60
+              }[interval]
+
               for name, ticker in SYMBOLS.items():
 
                   df = extract(data, ticker)
+                  df = clean_data(df, minutes)
 
-                  if df.empty:
-                      message = f"FAIL: {name} | {interval} | No data"
-                      print(message)
-                      failures.append(message)
-                      continue
-
-                  minutes = {
-                      "15m": 15,
-                      "30m": 30,
-                      "1h": 60
-                  }[interval]
-
-                  df = remove_open_candles(df, minutes)
-                  df = df.sort_index()
-
-                  duplicates = int(df.index.duplicated().sum())
-
-                  df = df[~df.index.duplicated(keep="last")]
-
-                  valid, reason = validate_ohlc(df)
+                  valid, reason = validate_data(df, interval)
 
                   if not valid:
                       message = f"FAIL: {name} | {interval} | {reason}"
@@ -239,11 +271,12 @@ jobs:
                       failures.append(message)
                       continue
 
+                  latest = float(df["Close"].iloc[-1])
+
                   print(
                       f"PASS: {name} | {interval} | "
                       f"Candles: {len(df)} | "
-                      f"Duplicates: {duplicates} | "
-                      f"Latest Close: {df['Close'].iloc[-1]}"
+                      f"Latest Close: {latest}"
                   )
 
                   base_pass += 1
@@ -251,96 +284,76 @@ jobs:
                   if interval == "1h":
                       hourly_data[name] = df
 
-          # --------------------------------------------------
-          # PART 2: RESAMPLING 1H TO 2H AND 4H
-          # --------------------------------------------------
-
+          # Resampling tests
           print("\n" + "=" * 65)
-          print("RESAMPLING TEST: 1H -> 2H AND 4H")
-          print("Only complete, closed candles are accepted.")
+          print("RESAMPLING: 1H -> 2H AND 4H")
           print("=" * 65)
 
           for name in SYMBOLS:
 
-              df = hourly_data.get(name, pd.DataFrame())
-
-              if df.empty:
-                  for hours in [2, 4]:
-                      message = (
-                          f"FAIL: {name} | {hours}H | "
-                          "Missing 1H source data"
-                      )
-                      print(message)
-                      failures.append(message)
-                  continue
+              source = hourly_data.get(name, pd.DataFrame())
 
               for hours in [2, 4]:
 
-                  resampled = resample_ohlc(df, hours)
+                  if source.empty:
+                      result = pd.DataFrame()
+                  else:
+                      result = resample_complete(source, hours)
 
-                  valid, reason = validate_ohlc(resampled)
+                  timeframe = f"{hours}h"
+                  valid, reason = validate_data(result, timeframe)
 
-                  if not valid or len(resampled) < 100:
+                  if not valid:
                       message = (
-                          f"FAIL: {name} | {hours}H | "
-                          f"{reason} | Candles: {len(resampled)}"
+                          f"FAIL: {name} | {timeframe} | {reason}"
                       )
                       print(message)
                       failures.append(message)
                       continue
 
+                  latest = float(result["Close"].iloc[-1])
+
                   print(
-                      f"PASS: {name} | {hours}H | "
-                      f"Candles: {len(resampled)} | "
-                      f"Latest Close: {resampled['Close'].iloc[-1]}"
+                      f"PASS: {name} | {timeframe} | "
+                      f"Candles: {len(result)} | "
+                      f"Latest Close: {latest}"
                   )
 
                   resample_pass += 1
 
-          # --------------------------------------------------
-          # PART 3: FINAL REPORT
-          # --------------------------------------------------
+          # Final report
+          base_total = len(SYMBOLS) * len(PERIODS)
+          resample_total = len(SYMBOLS) * 2
 
           print("\n" + "=" * 65)
-          print("FINAL VALIDATION REPORT")
+          print("FINAL DATA INTEGRITY REPORT")
           print("=" * 65)
 
+          print(f"BASE DATA: {base_pass}/{base_total}")
+          print(f"RESAMPLING: {resample_pass}/{resample_total}")
           print(
-              f"BASE DATA RESULT: {base_pass}/{base_total} PASSED"
+              f"OVERALL: {base_pass + resample_pass}/"
+              f"{base_total + resample_total}"
           )
 
-          print(
-              f"RESAMPLING RESULT: {resample_pass}/{resample_total} PASSED"
-          )
-
-          total_pass = base_pass + resample_pass
-          total_tests = base_total + resample_total
-
-          print(
-              f"OVERALL RESULT: {total_pass}/{total_tests} PASSED"
-          )
-
-          print("\nACTIVE TIMEFRAMES:")
-          print("15M: Direct Yahoo Finance")
-          print("30M: Direct Yahoo Finance")
-          print("1H: Direct Yahoo Finance")
-          print("2H: Resampled from 1H")
-          print("4H: Resampled from 1H")
+          print("\nTIMEFRAMES:")
+          print("15M: Direct")
+          print("30M: Direct")
+          print("1H: Direct")
+          print("2H: Complete 1H candles")
+          print("4H: Complete 1H candles")
           print("1D: EXCLUDED")
 
-          print("\nGOLD DATA WARNING:")
-          print("XAUUSD uses GC=F Gold Futures as a proxy.")
-          print("It is not identical to broker XAUUSD spot data.")
+          print("\nGOLD WARNING: GC=F is a futures proxy, not broker spot XAUUSD.")
 
           if failures:
               print("\nFAILED TESTS:")
               for item in failures:
                   print(item)
 
-              print("\nVALIDATION STATUS: FAILED")
+              print("\nSTATUS: FAILED")
               sys.exit(1)
 
-          print("\nVALIDATION STATUS: ALL TESTS PASSED")
-          print("PK BOT V6.4 DATA VALIDATION COMPLETE")
+          print("\nSTATUS: ALL DATA INTEGRITY TESTS PASSED")
 
           PY
