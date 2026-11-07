@@ -1,0 +1,260 @@
+name: PK BOT V6.4 - Data Validation Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  data-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Libraries
+        run: pip install yfinance pandas numpy
+
+      - name: Validate 15 Instruments and Timeframes
+        run: |
+          python - <<'PY'
+          import yfinance as yf
+          import pandas as pd
+          import numpy as np
+          import sys
+
+          SYMBOLS = {
+              "EURUSD": "EURUSD=X",
+              "GBPUSD": "GBPUSD=X",
+              "USDJPY": "JPY=X",
+              "USDCHF": "CHF=X",
+              "USDCAD": "CAD=X",
+              "AUDUSD": "AUDUSD=X",
+              "NZDUSD": "NZDUSD=X",
+              "EURJPY": "EURJPY=X",
+              "GBPJPY": "GBPJPY=X",
+              "EURGBP": "EURGBP=X",
+              "EURCHF": "EURCHF=X",
+              "AUDJPY": "AUDJPY=X",
+              "XAUUSD": "GC=F",
+              "XAGUSD": "SI=F",
+              "AUDCAD": "AUDCAD=X",
+          }
+
+          failures = []
+          total = 0
+          passed = 0
+
+          def extract_symbol(data, ticker):
+              if isinstance(data.columns, pd.MultiIndex):
+                  if ticker not in data.columns.get_level_values(0):
+                      return None
+                  return data[ticker].copy()
+              return data.copy()
+
+          def validate_ohlc(df):
+              required = ["Open", "High", "Low", "Close"]
+
+              if not all(col in df.columns for col in required):
+                  return False, "Missing OHLC columns"
+
+              x = df[required].dropna()
+
+              if len(x) < 2:
+                  return False, "Insufficient candles"
+
+              valid = (
+                  (x["High"] >= x["Low"]) &
+                  (x["High"] >= x["Open"]) &
+                  (x["High"] >= x["Close"]) &
+                  (x["Low"] <= x["Open"]) &
+                  (x["Low"] <= x["Close"])
+              )
+
+              if not valid.all():
+                  return False, "Invalid OHLC values"
+
+              if x.index.has_duplicates:
+                  return False, "Duplicate timestamps"
+
+              if not x.index.is_monotonic_increasing:
+                  return False, "Unsorted timestamps"
+
+              return True, "OK"
+
+          def report(name, timeframe, df):
+              global total, passed
+              total += 1
+
+              if df is None or len(df) < 2:
+                  failures.append(f"{name} {timeframe}: No/insufficient data")
+                  print(f"FAIL | {name:7} | {timeframe} | No data")
+                  return
+
+              ok, reason = validate_ohlc(df)
+
+              if ok:
+                  passed += 1
+                  print(
+                      f"PASS | {name:7} | {timeframe:4} | "
+                      f"{len(df)} candles | Latest Close: "
+                      f"{df['Close'].iloc[-1]:.6f}"
+                  )
+              else:
+                  failures.append(f"{name} {timeframe}: {reason}")
+                  print(f"FAIL | {name:7} | {timeframe} | {reason}")
+
+          print("PK BOT V6.4 DATA VALIDATION")
+          print("Instruments:", len(SYMBOLS))
+          print("Direct TF: 15m, 30m, 1h")
+          print("Resampled TF: 2h, 4h")
+          print("1D: EXCLUDED")
+          print("Gold/Silver use Yahoo Futures proxies")
+
+          downloads = {}
+
+          for interval, period in [
+              ("15m", "5d"),
+              ("30m", "5d"),
+              ("1h", "10d")
+          ]:
+              print(f"\nDownloading {interval} data...")
+
+              try:
+                  raw = yf.download(
+                      list(SYMBOLS.values()),
+                      period=period,
+                      interval=interval,
+                      group_by="ticker",
+                      auto_adjust=False,
+                      threads=True,
+                      progress=False,
+                      timeout=30,
+                      multi_level_index=True
+                  )
+                  downloads[interval] = raw
+              except Exception as e:
+                  print(f"DOWNLOAD ERROR {interval}: {e}")
+                  downloads[interval] = None
+
+          for name, ticker in SYMBOLS.items():
+              for interval in ["15m", "30m", "1h"]:
+                  raw = downloads.get(interval)
+
+                  if raw is None or raw.empty:
+                      report(name, interval, None)
+                      continue
+
+                  df = extract_symbol(raw, ticker)
+
+                  if df is not None:
+                      df = df.dropna(subset=["Open", "High", "Low", "Close"])
+                      df = df.sort_index()
+
+                  report(name, interval, df)
+
+              raw_1h = downloads.get("1h")
+
+              if raw_1h is None or raw_1h.empty:
+                  report(name, "2h", None)
+                  report(name, "4h", None)
+                  continue
+
+              hourly = extract_symbol(raw_1h, ticker)
+
+              if hourly is None:
+                  report(name, "2h", None)
+                  report(name, "4h", None)
+                  continue
+
+              hourly = hourly.dropna(
+                  subset=["Open", "High", "Low", "Close"]
+              ).sort_index()
+
+              # Exclude any still-forming 1H candle.
+              now = pd.Timestamp.now(tz=hourly.index.tz)
+              closed = hourly[
+                  hourly.index + pd.Timedelta(hours=1) <= now
+              ]
+
+              for hours in [2, 4]:
+                  timeframe = f"{hours}h"
+                  complete = []
+                  incomplete = 0
+
+                  grouped = closed.groupby(
+                      pd.Grouper(
+                          freq=f"{hours}h",
+                          origin="start_day",
+                          label="left",
+                          closed="left"
+                      )
+                  )
+
+                  for timestamp, group in grouped:
+                      if group.empty:
+                          continue
+
+                      expected = pd.date_range(
+                          start=timestamp,
+                          periods=hours,
+                          freq="1h",
+                          tz=group.index.tz
+                      )
+
+                      if (
+                          len(group) == hours
+                          and group.index.equals(expected)
+                      ):
+                          complete.append({
+                              "Open": group["Open"].iloc[0],
+                              "High": group["High"].max(),
+                              "Low": group["Low"].min(),
+                              "Close": group["Close"].iloc[-1],
+                              "Volume": group["Volume"].sum()
+                              if "Volume" in group.columns else 0
+                          })
+                      else:
+                          incomplete += 1
+
+                  resampled = pd.DataFrame(complete)
+
+                  if not resampled.empty:
+                      resampled.index = pd.DatetimeIndex(
+                          [pd.Timestamp(x) for x in
+                           [item for item in grouped.groups.keys()
+                            if item in grouped.groups]],
+                          tz=hourly.index.tz
+                      )[:len(resampled)] if False else resampled.index
+
+                  report(name, timeframe, resampled)
+
+                  print(
+                      f"INFO | {name:7} | {timeframe} | "
+                      f"Incomplete groups excluded: {incomplete}"
+                  )
+
+          print("\n========== FINAL REPORT ==========")
+          print("Total tests:", total)
+          print("Passed:", passed)
+          print("Failed:", len(failures))
+          print("Expected tests:", len(SYMBOLS) * 5)
+          print("1D tests: 0")
+
+          if failures:
+              print("\nFAILURE DETAILS:")
+              for item in failures:
+                  print("-", item)
+              print("\nSTATUS: VALIDATION FAILED")
+              sys.exit(1)
+
+          print("\nSTATUS: ALL DATA VALIDATION TESTS PASSED")
+          PY
