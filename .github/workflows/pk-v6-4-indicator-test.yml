@@ -1,0 +1,290 @@
+
+name: PK BOT V6.4 - Indicator Engine Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  indicator-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy yfinance
+
+      - name: Run indicator tests
+        run: |
+          python - <<'PY'
+          import sys
+          import time
+          import numpy as np
+          import pandas as pd
+          import yfinance as yf
+          from datetime import timedelta
+
+          sys.path.insert(0, ".github/workflows")
+          import pk_v6_4_indicators as engine
+
+          TICKERS = {
+              "EURUSD": "EURUSD=X",
+              "GBPUSD": "GBPUSD=X",
+              "USDJPY": "JPY=X",
+              "USDCHF": "CHF=X",
+              "USDCAD": "CAD=X",
+              "AUDUSD": "AUDUSD=X",
+              "NZDUSD": "NZDUSD=X",
+              "EURJPY": "EURJPY=X",
+              "GBPJPY": "GBPJPY=X",
+              "EURGBP": "EURGBP=X",
+              "EURCHF": "EURCHF=X",
+              "AUDJPY": "AUDJPY=X",
+              "XAUUSD": "GC=F",
+              "AUDCAD": "AUDCAD=X",
+          }
+
+          REQUIRED = [
+              "EMA20", "EMA100", "EMA200",
+              "RSI14", "RVI", "RVI_SIGNAL",
+              "ATR14", "PLUS_DI", "MINUS_DI",
+              "ADX14",
+              "CONFIRMED_PIVOT_HIGH",
+              "CONFIRMED_PIVOT_LOW",
+          ]
+
+          results = []
+
+          def extract_symbol(raw, ticker):
+              if raw is None or raw.empty:
+                  return None
+
+              if isinstance(raw.columns, pd.MultiIndex):
+                  for level in range(raw.columns.nlevels):
+                      if ticker in raw.columns.get_level_values(level):
+                          raw = raw.xs(
+                              ticker,
+                              axis=1,
+                              level=level,
+                              drop_level=True
+                          )
+                          break
+
+              required = ["Open", "High", "Low", "Close"]
+
+              if not all(c in raw.columns for c in required):
+                  return None
+
+              return raw[required].copy()
+
+          def closed_candles(df, minutes):
+              if df is None or df.empty:
+                  return pd.DataFrame()
+
+              df = df.copy()
+              idx = pd.to_datetime(df.index)
+
+              if idx.tz is None:
+                  idx = idx.tz_localize("UTC")
+              else:
+                  idx = idx.tz_convert("UTC")
+
+              df.index = idx
+              now = pd.Timestamp.now(tz="UTC")
+
+              # Keep only candles whose full duration has elapsed.
+              df = df[df.index + pd.Timedelta(minutes=minutes) <= now]
+
+              return df.sort_index()
+
+          def resample_complete(df, hours):
+              rule = f"{hours}h"
+              pieces = []
+
+              grouped = df.groupby(
+                  pd.Grouper(
+                      freq=rule,
+                      origin="start_day",
+                      label="left",
+                      closed="left"
+                  )
+              )
+
+              now = pd.Timestamp.now(tz="UTC")
+
+              for start, group in grouped:
+                  if group.empty or len(group) != hours:
+                      continue
+
+                  differences = group.index.to_series().diff().dropna()
+
+                  if not (differences == pd.Timedelta(hours=1)).all():
+                      continue
+
+                  if start + pd.Timedelta(hours=hours) > now:
+                      continue
+
+                  pieces.append({
+                      "time": start,
+                      "Open": group["Open"].iloc[0],
+                      "High": group["High"].max(),
+                      "Low": group["Low"].min(),
+                      "Close": group["Close"].iloc[-1],
+                  })
+
+              if not pieces:
+                  return pd.DataFrame()
+
+              result = pd.DataFrame(pieces).set_index("time")
+              result.index.name = "Datetime"
+              return result
+
+          def test_one(pair, timeframe, data):
+              try:
+                  data = engine.prepare_ohlc(data)
+
+                  if len(data) < 250:
+                      raise ValueError(
+                          f"Only {len(data)} valid candles; need 250"
+                      )
+
+                  output = engine.calculate_indicators(data)
+
+                  missing = [
+                      col for col in REQUIRED
+                      if col not in output.columns
+                  ]
+
+                  if missing:
+                      raise ValueError(
+                          "Missing indicator columns: " + ", ".join(missing)
+                      )
+
+                  invalid = []
+
+                  for col in REQUIRED:
+                      valid_count = np.isfinite(
+                          output[col].to_numpy(dtype=float)
+                      ).sum()
+
+                      if valid_count == 0:
+                          invalid.append(col)
+
+                  if invalid:
+                      raise ValueError(
+                          "No finite values for: " + ", ".join(invalid)
+                      )
+
+                  results.append((pair, timeframe, "PASS", len(output)))
+                  print(
+                      f"PASS | {pair:7} | {timeframe:3} | "
+                      f"{len(output)} candles"
+                  )
+
+              except Exception as exc:
+                  results.append((pair, timeframe, "FAIL", str(exc)))
+                  print(
+                      f"FAIL | {pair:7} | {timeframe:3} | {exc}"
+                  )
+
+          print("\nPK BOT V6.4 INDICATOR ENGINE TEST")
+          print("Instruments:", len(TICKERS))
+          print("Timeframes: 15m, 30m, 1h, 2h, 4h")
+          print("1D: EXCLUDED\n")
+
+          downloaded = {}
+
+          downloads = [
+              ("15m", "30d", 15),
+              ("30m", "60d", 30),
+              ("1h", "730d", 60),
+          ]
+
+          for interval, period, minutes in downloads:
+              symbols = list(TICKERS.values())
+
+              print(f"\nDownloading {interval} data...")
+
+              try:
+                  raw = yf.download(
+                      tickers=symbols,
+                      period=period,
+                      interval=interval,
+                      group_by="ticker",
+                      auto_adjust=False,
+                      progress=False,
+                      threads=False
+                  )
+              except Exception as exc:
+                  print("Download error:", exc)
+                  raw = pd.DataFrame()
+
+              for pair, ticker in TICKERS.items():
+                  symbol_data = extract_symbol(raw, ticker)
+
+                  if symbol_data is not None:
+                      symbol_data = closed_candles(
+                          symbol_data,
+                          minutes
+                      )
+
+                  downloaded[(pair, interval)] = symbol_data
+
+              time.sleep(2)
+
+          # Direct timeframes: 15m, 30m, 1h
+          for pair in TICKERS:
+              for interval in ["15m", "30m", "1h"]:
+                  data = downloaded.get((pair, interval))
+
+                  if data is None:
+                      data = pd.DataFrame()
+
+                  test_one(pair, interval, data)
+
+          # 2h and 4h are built from 1h candles.
+          for pair in TICKERS:
+              hourly = downloaded.get((pair, "1h"))
+
+              if hourly is None or hourly.empty:
+                  hourly = pd.DataFrame()
+
+              for hours in [2, 4]:
+                  timeframe = f"{hours}h"
+
+                  if hourly.empty:
+                      data = pd.DataFrame()
+                  else:
+                      data = resample_complete(hourly, hours)
+
+                  test_one(pair, timeframe, data)
+
+          passed = sum(1 for r in results if r[2] == "PASS")
+          failed = len(results) - passed
+
+          print("\n========== FINAL REPORT ==========")
+          print("Total tests:", len(results))
+          print("Passed:", passed)
+          print("Failed:", failed)
+
+          print("\nExpected tests: 70")
+          print("1D tests: 0")
+
+          if len(results) != 70 or failed:
+              print("\nSTATUS: FAILED")
+              sys.exit(1)
+
+          print("\nSTATUS: ALL INDICATOR TESTS PASSED")
+          PY
