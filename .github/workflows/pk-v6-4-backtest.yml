@@ -1,0 +1,55 @@
+
+name: PK BOT V6.4 - HISTORICAL BACKTEST
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/pk-v6-4-backtest.yml"
+      - ".github/workflows/pk_v6_4_backtest.py"
+      - ".github/workflows/pk_v6_4_signal_engine.py"
+      - ".github/workflows/pk_v6_4_indicators.py"
+      - ".github/workflows/pk_v6_4_price_action.py"
+
+permissions:
+  contents: read
+
+jobs:
+  historical-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas yfinance
+
+      - name: Compile V6.4 modules
+        run: |
+          python -m py_compile \
+            .github/workflows/pk_v6_4_indicators.py \
+            .github/workflows/pk_v6_4_price_action.py \
+            .github/workflows/pk_v6_4_signal_engine.py \
+            .github/workflows/pk_v6_4_backtest.py
+
+      - name: Run Historical Backtest
+        run: |
+          python .github/workflows/pk_v6_4_backtest.py
+
+      - name: Upload Backtest Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PK-BOT-V6.4-BACKTEST-REPORT
+          path: backtest-results/
+          if-no-files-found: warn
+          retention-days: 30
