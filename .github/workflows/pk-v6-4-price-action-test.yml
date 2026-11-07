@@ -1,0 +1,516 @@
+
+name: PK BOT V6.4 - Price Action Engine Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  price-action-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy yfinance
+
+      - name: Run Price Action Engine Tests
+        run: |
+          python - <<'PY'
+          import sys
+          import time
+          import numpy as np
+          import pandas as pd
+          import yfinance as yf
+
+          sys.path.insert(0, ".github/workflows")
+          import pk_v6_4_price_action as engine
+
+          TICKERS = {
+              "EURUSD": "EURUSD=X",
+              "GBPUSD": "GBPUSD=X",
+              "USDJPY": "JPY=X",
+              "USDCHF": "CHF=X",
+              "USDCAD": "CAD=X",
+              "AUDUSD": "AUDUSD=X",
+              "NZDUSD": "NZDUSD=X",
+              "EURJPY": "EURJPY=X",
+              "GBPJPY": "GBPJPY=X",
+              "EURGBP": "EURGBP=X",
+              "EURCHF": "EURCHF=X",
+              "AUDJPY": "AUDJPY=X",
+              "XAUUSD": "GC=F",
+              "AUDCAD": "AUDCAD=X",
+          }
+
+          REQUIRED = [
+              "ATR14",
+              "EMA100",
+              "CONFIRMED_PIVOT_HIGH",
+              "CONFIRMED_PIVOT_LOW",
+              "LAST_CONFIRMED_HIGH",
+              "LAST_CONFIRMED_LOW",
+              "BSL_SWEEP",
+              "SSL_SWEEP",
+              "BULLISH_FVG",
+              "BEARISH_FVG",
+              "BULLISH_IFVG",
+              "BEARISH_IFVG",
+              "BULLISH_DISPLACEMENT",
+              "BEARISH_DISPLACEMENT",
+              "BULLISH_EMA100_RETEST",
+              "BEARISH_EMA100_RETEST",
+          ]
+
+          results = []
+
+          def record(name, passed, detail=""):
+              status = "PASS" if passed else "FAIL"
+              results.append((name, status, detail))
+              print(f"{status} | {name} | {detail}")
+
+          # ------------------------------------------
+          # SYNTHETIC UNIT TESTS
+          # ------------------------------------------
+
+          print("\n========== UNIT TESTS ==========")
+
+          # Test 1: Pivot confirmation and no look-ahead.
+          idx = pd.date_range(
+              "2026-01-01",
+              periods=6,
+              freq="h",
+              tz="UTC"
+          )
+
+          pivot_data = pd.DataFrame({
+              "Open":  [2, 3, 4, 3, 2, 3],
+              "High":  [3, 4, 10, 5, 4, 5],
+              "Low":   [1, 2, 3, 2, 1, 2],
+              "Close": [2, 3, 5, 3, 2, 4],
+          }, index=idx)
+
+          pivot_result = engine.calculate_confirmed_pivots(
+              pivot_data.copy()
+          )
+
+          pivot_at_confirmation = (
+              pivot_result["CONFIRMED_PIVOT_HIGH"].iloc[4] == 10
+          )
+
+          no_lookahead = (
+              pd.isna(
+                  pivot_result["LAST_CONFIRMED_HIGH"].iloc[4]
+              )
+              and
+              pivot_result["LAST_CONFIRMED_HIGH"].iloc[5] == 10
+          )
+
+          record(
+              "Pivot confirmation",
+              pivot_at_confirmation,
+              "Center pivot confirmed after two right candles"
+          )
+
+          record(
+              "Pivot no-lookahead",
+              no_lookahead,
+              "Pivot unavailable before confirmation"
+          )
+
+          # Test 2: Liquidity sweep.
+          sweep_data = pd.DataFrame({
+              "Open": [10, 10],
+              "High": [12, 13],
+              "Low": [9, 8],
+              "Close": [11, 9],
+              "LAST_CONFIRMED_HIGH": [11, 11],
+              "LAST_CONFIRMED_LOW": [9, 9],
+          })
+
+          sweep_result = engine.detect_liquidity_sweep(
+              sweep_data.copy()
+          )
+
+          sweep_ok = (
+              bool(sweep_result["BSL_SWEEP"].iloc[0])
+              and
+              bool(sweep_result["SSL_SWEEP"].iloc[1])
+          )
+
+          record(
+              "Liquidity sweep",
+              sweep_ok,
+              "Wick beyond pivot and close back inside"
+          )
+
+          # Test 3: Bullish and bearish FVG.
+          fvg_data = pd.DataFrame({
+              "Open":  [10, 11, 13],
+              "High":  [12, 13, 15],
+              "Low":   [9, 10, 13],
+              "Close": [11, 12, 14],
+              "ATR14": [1, 1, 1],
+          })
+
+          fvg_result = engine.detect_fvg(fvg_data.copy())
+
+          bullish_fvg_ok = bool(
+              fvg_result["BULLISH_FVG"].iloc[2]
+          )
+
+          record(
+              "Bullish FVG",
+              bullish_fvg_ok,
+              "Third candle low above first candle high"
+          )
+
+          bearish_data = pd.DataFrame({
+              "Open":  [13, 12, 10],
+              "High":  [15, 13, 11],
+              "Low":   [12, 10, 8],
+              "Close": [14, 11, 9],
+              "ATR14": [1, 1, 1],
+          })
+
+          bearish_result = engine.detect_fvg(
+              bearish_data.copy()
+          )
+
+          record(
+              "Bearish FVG",
+              bool(bearish_result["BEARISH_FVG"].iloc[2]),
+              "Third candle high below first candle low"
+          )
+
+          # Test 4: IFVG invalidation and retest.
+          bullish_zone_data = pd.DataFrame({
+              "Open":  [10, 11, 13, 10, 9],
+              "High":  [12, 13, 15, 11, 11],
+              "Low":   [9, 10, 13, 8, 8],
+              "Close": [11, 12, 14, 9, 9],
+              "ATR14": [1, 1, 1, 1, 1],
+          })
+
+          bullish_zone_data = engine.detect_fvg(
+              bullish_zone_data
+          )
+
+          bullish_ifvg_result = engine.detect_ifvg(
+              bullish_zone_data
+          )
+
+          record(
+              "Bearish IFVG",
+              bool(
+                  bullish_ifvg_result["BEARISH_IFVG"].iloc[4]
+              ),
+              "Bullish FVG invalidated, then retested from below"
+          )
+
+          bearish_zone_data = pd.DataFrame({
+              "Open":  [13, 12, 10, 13, 14],
+              "High":  [15, 13, 11, 15, 16],
+              "Low":   [12, 10, 8, 12, 13],
+              "Close": [14, 11, 9, 14, 14],
+              "ATR14": [1, 1, 1, 1, 1],
+          })
+
+          bearish_zone_data = engine.detect_fvg(
+              bearish_zone_data
+          )
+
+          bearish_ifvg_result = engine.detect_ifvg(
+              bearish_zone_data
+          )
+
+          record(
+              "Bullish IFVG",
+              bool(
+                  bearish_ifvg_result["BULLISH_IFVG"].iloc[4]
+              ),
+              "Bearish FVG invalidated, then retested from above"
+          )
+
+          # Test 5: Displacement.
+          displacement_data = pd.DataFrame({
+              "Open": [10, 10],
+              "High": [12, 15],
+              "Low": [9, 9],
+              "Close": [11, 14],
+              "ATR14": [1, 1],
+          })
+
+          displacement_result = engine.detect_displacement(
+              displacement_data.copy()
+          )
+
+          record(
+              "Bullish displacement",
+              bool(
+                  displacement_result[
+                      "BULLISH_DISPLACEMENT"
+                  ].iloc[1]
+              ),
+              "Body ratio and ATR threshold"
+          )
+
+          # Test 6: EMA100 retest.
+          ema_data = pd.DataFrame({
+              "Open": [99],
+              "High": [101],
+              "Low": [98],
+              "Close": [100.5],
+              "EMA100": [100],
+              "ATR14": [1],
+          })
+
+          ema_result = engine.detect_ema100_retest(
+              ema_data.copy()
+          )
+
+          record(
+              "Bullish EMA100 retest",
+              bool(
+                  ema_result[
+                      "BULLISH_EMA100_RETEST"
+                  ].iloc[0]
+              ),
+              "Touches tolerance zone and closes bullish above EMA"
+          )
+
+          # ------------------------------------------
+          # LIVE HISTORICAL DATA TESTS
+          # ------------------------------------------
+
+          print("\n========== MARKET DATA TESTS ==========")
+
+          def extract_symbol(raw, ticker):
+              if raw is None or raw.empty:
+                  return None
+
+              if isinstance(raw.columns, pd.MultiIndex):
+                  for level in range(raw.columns.nlevels):
+                      if ticker in raw.columns.get_level_values(level):
+                          raw = raw.xs(
+                              ticker,
+                              axis=1,
+                              level=level,
+                              drop_level=True
+                          )
+                          break
+
+              required = ["Open", "High", "Low", "Close"]
+
+              if not all(c in raw.columns for c in required):
+                  return None
+
+              return raw[required].copy()
+
+          def closed_candles(df, minutes):
+              if df is None or df.empty:
+                  return pd.DataFrame()
+
+              df = df.copy()
+              idx = pd.to_datetime(df.index)
+
+              if idx.tz is None:
+                  idx = idx.tz_localize("UTC")
+              else:
+                  idx = idx.tz_convert("UTC")
+
+              df.index = idx
+
+              now = pd.Timestamp.now(tz="UTC")
+
+              return df[
+                  df.index + pd.Timedelta(minutes=minutes) <= now
+              ].sort_index()
+
+          def resample_complete(df, hours):
+              pieces = []
+              rule = f"{hours}h"
+
+              grouped = df.groupby(
+                  pd.Grouper(
+                      freq=rule,
+                      origin="start_day",
+                      label="left",
+                      closed="left"
+                  )
+              )
+
+              now = pd.Timestamp.now(tz="UTC")
+
+              for start, group in grouped:
+                  if group.empty or len(group) != hours:
+                      continue
+
+                  diffs = group.index.to_series().diff().dropna()
+
+                  if not (
+                      diffs == pd.Timedelta(hours=1)
+                  ).all():
+                      continue
+
+                  if start + pd.Timedelta(hours=hours) > now:
+                      continue
+
+                  pieces.append({
+                      "time": start,
+                      "Open": group["Open"].iloc[0],
+                      "High": group["High"].max(),
+                      "Low": group["Low"].min(),
+                      "Close": group["Close"].iloc[-1],
+                  })
+
+              if not pieces:
+                  return pd.DataFrame()
+
+              result = pd.DataFrame(pieces).set_index("time")
+              result.index.name = "Datetime"
+              return result
+
+          def test_market(pair, timeframe, data):
+              name = f"{pair} {timeframe}"
+
+              try:
+                  if data is None or data.empty:
+                      raise ValueError("No market data")
+
+                  df = engine.calculate_price_action(data)
+
+                  missing = [
+                      c for c in REQUIRED if c not in df.columns
+                  ]
+
+                  if missing:
+                      raise ValueError(
+                          "Missing columns: " + ", ".join(missing)
+                      )
+
+                  # ATR and EMA must have usable values.
+                  for col in ["ATR14", "EMA100"]:
+                      count = np.isfinite(
+                          df[col].to_numpy(dtype=float)
+                      ).sum()
+
+                      if count == 0:
+                          raise ValueError(
+                              f"No finite values in {col}"
+                          )
+
+                  # Detection columns must be boolean.
+                  boolean_columns = [
+                      "BSL_SWEEP",
+                      "SSL_SWEEP",
+                      "BULLISH_FVG",
+                      "BEARISH_FVG",
+                      "BULLISH_IFVG",
+                      "BEARISH_IFVG",
+                      "BULLISH_DISPLACEMENT",
+                      "BEARISH_DISPLACEMENT",
+                      "BULLISH_EMA100_RETEST",
+                      "BEARISH_EMA100_RETEST",
+                  ]
+
+                  for col in boolean_columns:
+                      if not pd.api.types.is_bool_dtype(df[col]):
+                          raise ValueError(
+                              f"{col} is not boolean"
+                          )
+
+                  record(
+                      name,
+                      True,
+                      f"{len(df)} candles; all detection columns valid"
+                  )
+
+              except Exception as exc:
+                  record(name, False, str(exc))
+
+          downloaded = {}
+
+          for interval, period, minutes in [
+              ("15m", "30d", 15),
+              ("30m", "60d", 30),
+              ("1h", "730d", 60),
+          ]:
+
+              print(f"\nDownloading {interval}...")
+
+              try:
+                  raw = yf.download(
+                      tickers=list(TICKERS.values()),
+                      period=period,
+                      interval=interval,
+                      group_by="ticker",
+                      auto_adjust=False,
+                      progress=False,
+                      threads=False
+                  )
+              except Exception as exc:
+                  print("Download error:", exc)
+                  raw = pd.DataFrame()
+
+              for pair, ticker in TICKERS.items():
+                  symbol_data = extract_symbol(raw, ticker)
+
+                  if symbol_data is not None:
+                      symbol_data = closed_candles(
+                          symbol_data,
+                          minutes
+                      )
+
+                  downloaded[(pair, interval)] = symbol_data
+
+              time.sleep(2)
+
+          for pair in TICKERS:
+              for interval in ["15m", "30m", "1h"]:
+                  data = downloaded.get((pair, interval))
+                  test_market(pair, interval, data)
+
+          for pair in TICKERS:
+              hourly = downloaded.get((pair, "1h"))
+
+              for hours in [2, 4]:
+                  if hourly is None or hourly.empty:
+                      data = pd.DataFrame()
+                  else:
+                      data = resample_complete(hourly, hours)
+
+                  test_market(pair, f"{hours}h", data)
+
+          # ------------------------------------------
+          # FINAL REPORT
+          # ------------------------------------------
+
+          passed = sum(1 for _, status, _ in results if status == "PASS")
+          failed = sum(1 for _, status, _ in results if status == "FAIL")
+
+          print("\n========== FINAL REPORT ==========")
+          print("Total tests:", len(results))
+          print("Passed:", passed)
+          print("Failed:", failed)
+          print("Market tests expected: 70")
+          print("1D tests: 0")
+
+          if failed or len(results) != 79:
+              print("\nSTATUS: FAILED")
+              sys.exit(1)
+
+          print("\nSTATUS: ALL PRICE ACTION TESTS PASSED")
+          PY
