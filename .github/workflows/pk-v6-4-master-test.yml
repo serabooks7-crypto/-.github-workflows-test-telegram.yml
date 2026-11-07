@@ -1,0 +1,574 @@
+
+name: PK BOT V6.4 - MASTER TEST
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/pk-v6-4-master-test.yml"
+      - ".github/workflows/pk_v6_4_indicators.py"
+      - ".github/workflows/pk_v6_4_price_action.py"
+      - ".github/workflows/pk_v6_4_signal_engine.py"
+
+permissions:
+  contents: read
+
+jobs:
+  master-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas
+
+      - name: Run PK BOT V6.4 Master Tests
+        run: |
+          python - <<'PY'
+          import sys
+          import numpy as np
+          import pandas as pd
+
+          sys.path.insert(0, ".github/workflows")
+
+          from pk_v6_4_indicators import (
+              calculate_indicators,
+              calculate_rvi
+          )
+
+          from pk_v6_4_price_action import (
+              calculate_price_action
+          )
+
+          import pk_v6_4_signal_engine as engine
+
+          passed = 0
+          failed = 0
+
+          def check(name, condition):
+              global passed, failed
+              if condition:
+                  passed += 1
+                  print("PASS:", name)
+              else:
+                  failed += 1
+                  print("FAIL:", name)
+
+          def section(name):
+              print("\n" + "=" * 55)
+              print(name)
+              print("=" * 55)
+
+          np.random.seed(64)
+
+          # -----------------------------------------
+          # 1. INDICATOR ENGINE
+          # -----------------------------------------
+
+          section("1. INDICATOR ENGINE")
+
+          n = 400
+          dates = pd.date_range(
+              "2025-01-01",
+              periods=n,
+              freq="h"
+          )
+
+          close = 2000 + np.cumsum(
+              np.random.normal(0, 2, n)
+          )
+
+          open_price = close + np.random.normal(0, 0.8, n)
+          high = np.maximum(open_price, close) + 1.5
+          low = np.minimum(open_price, close) - 1.5
+
+          raw = pd.DataFrame({
+              "Open": open_price,
+              "High": high,
+              "Low": low,
+              "Close": close
+          }, index=dates)
+
+          indicators = calculate_indicators(raw)
+
+          required = [
+              "EMA20", "EMA100", "EMA200",
+              "RSI14", "RVI", "RVI_SIGNAL",
+              "ATR14", "PLUS_DI", "MINUS_DI",
+              "ADX14",
+              "CONFIRMED_PIVOT_HIGH",
+              "CONFIRMED_PIVOT_LOW"
+          ]
+
+          check(
+              "All required indicator columns",
+              all(c in indicators.columns for c in required)
+          )
+
+          rvi = calculate_rvi(
+              raw.copy(),
+              period=8,
+              signal_period=6
+          )
+
+          check(
+              "RVI Main Period 8",
+              rvi["RVI"].notna().sum() > 0
+          )
+
+          check(
+              "RVI Signal Line Period 6",
+              rvi["RVI_SIGNAL"].notna().sum() > 0
+          )
+
+          check(
+              "RVI Signal WMA weights 1 to 6",
+              np.isfinite(
+                  rvi["RVI_SIGNAL"].dropna().to_numpy()
+              ).all()
+          )
+
+          # -----------------------------------------
+          # 2. PRICE ACTION ENGINE
+          # -----------------------------------------
+
+          section("2. PRICE ACTION ENGINE")
+
+          pa = calculate_price_action(raw)
+
+          pa_required = [
+              "LAST_CONFIRMED_HIGH",
+              "LAST_CONFIRMED_LOW",
+              "BSL_SWEEP",
+              "SSL_SWEEP",
+              "BULLISH_FVG",
+              "BEARISH_FVG",
+              "BULLISH_IFVG",
+              "BEARISH_IFVG",
+              "BULLISH_DISPLACEMENT",
+              "BEARISH_DISPLACEMENT",
+              "BULLISH_EMA100_RETEST",
+              "BEARISH_EMA100_RETEST"
+          ]
+
+          check(
+              "All required Price Action columns",
+              all(c in pa.columns for c in pa_required)
+          )
+
+          check(
+              "Liquidity sweep columns are boolean",
+              pd.api.types.is_bool_dtype(pa["BSL_SWEEP"])
+              and pd.api.types.is_bool_dtype(pa["SSL_SWEEP"])
+          )
+
+          check(
+              "FVG and IFVG columns are boolean",
+              all(
+                  pd.api.types.is_bool_dtype(pa[c])
+                  for c in [
+                      "BULLISH_FVG",
+                      "BEARISH_FVG",
+                      "BULLISH_IFVG",
+                      "BEARISH_IFVG"
+                  ]
+              )
+          )
+
+          # -----------------------------------------
+          # 3. TIMEFRAME AND HTF VALIDATION
+          # -----------------------------------------
+
+          section("3. TIMEFRAME AND HTF VALIDATION")
+
+          timeframe_data = {}
+
+          for tf, freq in [
+              ("15m", "15min"),
+              ("30m", "30min"),
+              ("1h", "1h"),
+              ("2h", "2h"),
+              ("4h", "4h")
+          ]:
+              idx = pd.date_range(
+                  "2025-01-01",
+                  periods=300,
+                  freq=freq
+              )
+
+              base = 2000 + np.cumsum(
+                  np.random.normal(0, 1.5, 300)
+              )
+
+              op = base + np.random.normal(0, 0.5, 300)
+              hi = np.maximum(op, base) + 1
+              lo = np.minimum(op, base) - 1
+
+              timeframe_data[tf] = pd.DataFrame({
+                  "Open": op,
+                  "High": hi,
+                  "Low": lo,
+                  "Close": base
+              }, index=idx)
+
+          check(
+              "All five required timeframes accepted",
+              engine.validate_timeframe_data(timeframe_data)
+          )
+
+          test_signal = pd.DataFrame(
+              {"Close": [100, 101]},
+              index=pd.to_datetime([
+                  "2025-01-01 00:00",
+                  "2025-01-01 04:00"
+              ])
+          )
+
+          test_htf = pd.DataFrame(
+              {
+                  "Close": [110, 120],
+                  "EMA200": [100, 105]
+              },
+              index=pd.to_datetime([
+                  "2025-01-01 00:00",
+                  "2025-01-01 04:00"
+              ])
+          )
+
+          mapped = engine.attach_closed_htf_filter(
+              test_signal.copy(),
+              test_htf,
+              "15m",
+              "4h",
+              "H4"
+          )
+
+          check(
+              "HTF candle not used before its close",
+              pd.isna(mapped["H4_CLOSE"].iloc[0])
+          )
+
+          check(
+              "Completed HTF candle becomes available",
+              mapped["H4_CLOSE"].iloc[1] == 110
+          )
+
+          # -----------------------------------------
+          # 4. RSI AND RVI CROSSBACK
+          # -----------------------------------------
+
+          section("4. RSI AND RVI CROSSBACK")
+
+          buy_rsi = pd.Series([20, 14, 16])
+          sell_rsi = pd.Series([80, 86, 84])
+
+          check(
+              "RSI BUY cross-back at 15",
+              engine.detect_crossback(
+                  buy_rsi, 15, "BUY"
+              ).iloc[2]
+          )
+
+          check(
+              "RSI SELL cross-back at 85",
+              engine.detect_crossback(
+                  sell_rsi, 85, "SELL"
+              ).iloc[2]
+          )
+
+          buy_rvi = pd.Series([-0.3, -0.5, -0.3])
+          sell_rvi = pd.Series([0.3, 0.5, 0.3])
+
+          check(
+              "RVI BUY cross-back at -0.400",
+              engine.detect_crossback(
+                  buy_rvi, -0.400, "BUY"
+              ).iloc[2]
+          )
+
+          check(
+              "RVI SELL cross-back at +0.400",
+              engine.detect_crossback(
+                  sell_rvi, 0.400, "SELL"
+              ).iloc[2]
+          )
+
+          # -----------------------------------------
+          # 5. RSI AND RVI STRATEGY FILTERS
+          # -----------------------------------------
+
+          section("5. RSI AND RVI STRATEGY FILTERS")
+
+          idx = pd.date_range(
+              "2025-01-01",
+              periods=3,
+              freq="15min"
+          )
+
+          strategy_df = pd.DataFrame({
+              "RSI14": [20, 14, 16],
+              "RVI_SIGNAL": [-0.3, -0.5, -0.3],
+              "SSL_SWEEP": [False, False, True],
+              "BSL_SWEEP": [False, False, False],
+              "H4_BULLISH": [True, True, True],
+              "H4_BEARISH": [False, False, False],
+              "H2_BULLISH": [True, True, True],
+              "H2_BEARISH": [False, False, False]
+          }, index=idx)
+
+          rsi_buy, rsi_sell = engine.evaluate_rsi_strategy(
+              strategy_df
+          )
+
+          rvi_buy, rvi_sell = engine.evaluate_rvi_strategy(
+              strategy_df
+          )
+
+          check(
+              "RSI BUY requires SSL sweep and H4 filter",
+              bool(rsi_buy.iloc[2])
+          )
+
+          check(
+              "RSI SELL not falsely triggered",
+              not bool(rsi_sell.iloc[2])
+          )
+
+          check(
+              "RVI BUY requires SSL sweep and H2 filter",
+              bool(rvi_buy.iloc[2])
+          )
+
+          check(
+              "RVI SELL not falsely triggered",
+              not bool(rvi_sell.iloc[2])
+          )
+
+          # -----------------------------------------
+          # 6. EMA CROSSOVER -> RETEST -> CONFIRMATION
+          # -----------------------------------------
+
+          section("6. EMA SEQUENCE")
+
+          ema_df = pd.DataFrame({
+              "EMA20": [9, 11, 12, 13, 14],
+              "EMA100": [10, 10, 10, 10, 10],
+              "BULLISH_EMA100_RETEST": [
+                  False, False, True, False, False
+              ],
+              "BEARISH_EMA100_RETEST": [
+                  False, False, False, False, False
+              ],
+              "BULLISH_DISPLACEMENT": [
+                  False, False, False, True, False
+              ],
+              "BEARISH_DISPLACEMENT": [
+                  False, False, False, False, False
+              ],
+              "BULLISH_FVG": [False] * 5,
+              "BEARISH_FVG": [False] * 5,
+              "BULLISH_IFVG": [False] * 5,
+              "BEARISH_IFVG": [False] * 5,
+              "H4_BULLISH": [True] * 5,
+              "H4_BEARISH": [False] * 5
+          })
+
+          ema_buy, ema_sell = engine.evaluate_ema_strategy(
+              ema_df
+          )
+
+          check(
+              "EMA BUY after crossover, later retest and confirmation",
+              bool(ema_buy.iloc[3])
+          )
+
+          check(
+              "EMA does not signal on crossover candle",
+              not bool(ema_buy.iloc[1])
+          )
+
+          check(
+              "EMA does not signal on retest candle",
+              not bool(ema_buy.iloc[2])
+          )
+
+          check(
+              "EMA SELL not falsely triggered",
+              not bool(ema_sell.any())
+          )
+
+          # -----------------------------------------
+          # 7. SIGNAL ID AND TRADE MANAGEMENT
+          # -----------------------------------------
+
+          section("7. SIGNAL ID AND TRADE MANAGEMENT")
+
+          signal_time = pd.Timestamp("2025-01-01 10:00")
+
+          id1 = engine.create_signal_id(
+              "XAUUSD", "15m", "RVI", "BUY", signal_time
+          )
+
+          id2 = engine.create_signal_id(
+              "XAUUSD", "15m", "RVI", "BUY", signal_time
+          )
+
+          check(
+              "Signal ID is deterministic",
+              id1 == id2 and id1.startswith("PK64-")
+          )
+
+          buy_levels = engine.calculate_trade_levels(
+              "BUY", 100, 2, 98, [110, 120]
+          )
+
+          sell_levels = engine.calculate_trade_levels(
+              "SELL", 100, 2, 102, [90, 80]
+          )
+
+          check(
+              "BUY SL uses ATR x 0.12 buffer",
+              buy_levels is not None
+              and abs(buy_levels["SL"] - 97.76) < 1e-9
+          )
+
+          check(
+              "SELL SL uses ATR x 0.12 buffer",
+              sell_levels is not None
+              and abs(sell_levels["SL"] - 102.24) < 1e-9
+          )
+
+          check(
+              "BUY TP1 minimum reward-risk 1:4",
+              buy_levels is not None
+              and abs(buy_levels["RR_TP1"] - 4.0) < 1e-9
+          )
+
+          check(
+              "SELL TP1 minimum reward-risk 1:4",
+              sell_levels is not None
+              and abs(sell_levels["RR_TP1"] - 4.0) < 1e-9
+          )
+
+          check(
+              "TP2 is informational and separate from TP1",
+              buy_levels is not None
+              and buy_levels["TP2"] == 110
+              and buy_levels["TP1"] == 109.76
+          )
+
+          # -----------------------------------------
+          # 8. NEXT CANDLE ENTRY
+          # -----------------------------------------
+
+          section("8. NEXT CANDLE ENTRY")
+
+          trade_df = pd.DataFrame({
+              "Open": [100, 101, 102],
+              "ATR14": [2, 2, 2],
+              "CONFIRMED_PIVOT_LOW": [97, np.nan, np.nan],
+              "CONFIRMED_PIVOT_HIGH": [np.nan, np.nan, np.nan]
+          }, index=pd.date_range(
+              "2025-01-01",
+              periods=3,
+              freq="15min"
+          ))
+
+          trade_row = engine.build_signal_row(
+              "XAUUSD",
+              "15m",
+              "RVI",
+              "BUY",
+              trade_df,
+              0
+          )
+
+          check(
+              "Entry uses next candle Open",
+              trade_row["ENTRY"] == 101
+          )
+
+          check(
+              "Entry time uses next candle timestamp",
+              trade_row["ENTRY_TIME"] == trade_df.index[1]
+          )
+
+          check(
+              "Signal status becomes ENTRY_READY",
+              trade_row["STATUS"] == "ENTRY_READY"
+          )
+
+          # -----------------------------------------
+          # 9. FULL ENGINE INTEGRATION
+          # -----------------------------------------
+
+          section("9. FULL ENGINE INTEGRATION")
+
+          try:
+              signals = engine.build_signals(
+                  timeframe_data,
+                  "XAUUSD"
+              )
+
+              expected_columns = [
+                  "SIGNAL_ID",
+                  "SYMBOL",
+                  "TIMEFRAME",
+                  "STRATEGY",
+                  "DIRECTION",
+                  "ENTRY",
+                  "SL",
+                  "TP1",
+                  "TP2",
+                  "STATUS"
+              ]
+
+              check(
+                  "Full build_signals runs without exception",
+                  all(c in signals.columns for c in expected_columns)
+              )
+
+              check(
+                  "No duplicate Signal IDs in generated results",
+                  signals["SIGNAL_ID"].is_unique
+              )
+
+              check(
+                  "Only permitted signal timeframes",
+                  signals.empty or signals["TIMEFRAME"].isin(
+                      ["15m", "30m", "1h", "2h", "4h"]
+                  ).all()
+              )
+
+          except Exception as exc:
+              failed += 1
+              print("FAIL: Full engine integration:", repr(exc))
+
+          # -----------------------------------------
+          # FINAL REPORT
+          # -----------------------------------------
+
+          section("MASTER TEST SUMMARY")
+
+          print("PK BOT V6.4")
+          print("Passed:", passed)
+          print("Failed:", failed)
+          print("Total:", passed + failed)
+
+          if failed:
+              print("MASTER TEST FAILED")
+              sys.exit(1)
+
+          print("ALL MASTER TESTS PASSED")
+          print("No live orders were placed.")
+          print("No Telegram messages were sent.")
+          PY
