@@ -56,18 +56,14 @@ jobs:
           }
 
           REQUIRED = [
-              "ATR14",
-              "EMA100",
+              "ATR14", "EMA100",
               "CONFIRMED_PIVOT_HIGH",
               "CONFIRMED_PIVOT_LOW",
               "LAST_CONFIRMED_HIGH",
               "LAST_CONFIRMED_LOW",
-              "BSL_SWEEP",
-              "SSL_SWEEP",
-              "BULLISH_FVG",
-              "BEARISH_FVG",
-              "BULLISH_IFVG",
-              "BEARISH_IFVG",
+              "BSL_SWEEP", "SSL_SWEEP",
+              "BULLISH_FVG", "BEARISH_FVG",
+              "BULLISH_IFVG", "BEARISH_IFVG",
               "BULLISH_DISPLACEMENT",
               "BEARISH_DISPLACEMENT",
               "BULLISH_EMA100_RETEST",
@@ -81,13 +77,13 @@ jobs:
               results.append((name, status, detail))
               print(f"{status} | {name} | {detail}")
 
-          # ------------------------------------------
-          # SYNTHETIC UNIT TESTS
-          # ------------------------------------------
+          # ==========================================
+          # 1. SYNTHETIC UNIT TESTS
+          # ==========================================
 
-          print("\n========== UNIT TESTS ==========")
+          print("\n========== SYNTHETIC UNIT TESTS ==========")
 
-          # Test 1: Pivot confirmation and no look-ahead.
+          # TEST 1: Confirmed pivot
           idx = pd.date_range(
               "2026-01-01",
               periods=6,
@@ -106,36 +102,30 @@ jobs:
               pivot_data.copy()
           )
 
-          pivot_at_confirmation = (
-              pivot_result["CONFIRMED_PIVOT_HIGH"].iloc[4] == 10
-          )
-
-          no_lookahead = (
-              pd.isna(
-                  pivot_result["LAST_CONFIRMED_HIGH"].iloc[4]
-              )
-              and
-              pivot_result["LAST_CONFIRMED_HIGH"].iloc[5] == 10
-          )
-
           record(
               "Pivot confirmation",
-              pivot_at_confirmation,
-              "Center pivot confirmed after two right candles"
+              pivot_result["CONFIRMED_PIVOT_HIGH"].iloc[4] == 10,
+              "Five-candle pivot confirmed after two right candles"
           )
 
           record(
               "Pivot no-lookahead",
-              no_lookahead,
+              (
+                  pd.isna(
+                      pivot_result["LAST_CONFIRMED_HIGH"].iloc[4]
+                  )
+                  and
+                  pivot_result["LAST_CONFIRMED_HIGH"].iloc[5] == 10
+              ),
               "Pivot unavailable before confirmation"
           )
 
-          # Test 2: Liquidity sweep.
+          # TEST 2: Liquidity sweep
           sweep_data = pd.DataFrame({
               "Open": [10, 10],
               "High": [12, 13],
               "Low": [9, 8],
-              "Close": [11, 9],
+              "Close": [10.5, 9.5],
               "LAST_CONFIRMED_HIGH": [11, 11],
               "LAST_CONFIRMED_LOW": [9, 9],
           })
@@ -144,43 +134,38 @@ jobs:
               sweep_data.copy()
           )
 
-          sweep_ok = (
-              bool(sweep_result["BSL_SWEEP"].iloc[0])
-              and
-              bool(sweep_result["SSL_SWEEP"].iloc[1])
-          )
-
           record(
               "Liquidity sweep",
-              sweep_ok,
-              "Wick beyond pivot and close back inside"
+              (
+                  bool(sweep_result["BSL_SWEEP"].iloc[0])
+                  and
+                  bool(sweep_result["SSL_SWEEP"].iloc[1])
+              ),
+              "Wick beyond level and close back inside"
           )
 
-          # Test 3: Bullish and bearish FVG.
+          # TEST 3: Bullish FVG
           fvg_data = pd.DataFrame({
-              "Open":  [10, 11, 13],
-              "High":  [12, 13, 15],
-              "Low":   [9, 10, 13],
+              "Open": [10, 11, 13],
+              "High": [12, 13, 15],
+              "Low": [9, 10, 13],
               "Close": [11, 12, 14],
               "ATR14": [1, 1, 1],
           })
 
           fvg_result = engine.detect_fvg(fvg_data.copy())
 
-          bullish_fvg_ok = bool(
-              fvg_result["BULLISH_FVG"].iloc[2]
-          )
-
           record(
               "Bullish FVG",
-              bullish_fvg_ok,
+              bool(fvg_result["BULLISH_FVG"].iloc[2]),
               "Third candle low above first candle high"
           )
 
+          # TEST 4: Bearish FVG
           bearish_data = pd.DataFrame({
-              "Open":  [13, 12, 10],
-              "High":  [15, 13, 11],
-              "Low":   [12, 10, 8],
+              "Open": [13, 12, 10],
+              "High": [15, 13, 11],
+              "Low": [12, 10, 8],
               "Close": [14, 11, 9],
               "ATR14": [1, 1, 1],
           })
@@ -195,12 +180,12 @@ jobs:
               "Third candle high below first candle low"
           )
 
-          # Test 4: IFVG invalidation and retest.
+          # TEST 5: Bearish IFVG
           bullish_zone_data = pd.DataFrame({
-              "Open":  [10, 11, 13, 10, 9],
-              "High":  [12, 13, 15, 11, 11],
-              "Low":   [9, 10, 13, 8, 8],
-              "Close": [11, 12, 14, 9, 9],
+              "Open": [10, 11, 13, 10, 9],
+              "High": [12, 13, 15, 11, 12.5],
+              "Low": [9, 10, 13, 8, 8],
+              "Close": [11, 12, 14, 9, 11.5],
               "ATR14": [1, 1, 1, 1, 1],
           })
 
@@ -208,23 +193,26 @@ jobs:
               bullish_zone_data
           )
 
-          bullish_ifvg_result = engine.detect_ifvg(
+          bearish_ifvg_result = engine.detect_ifvg(
               bullish_zone_data
           )
 
           record(
               "Bearish IFVG",
               bool(
-                  bullish_ifvg_result["BEARISH_IFVG"].iloc[4]
+                  bearish_ifvg_result[
+                      "BEARISH_IFVG"
+                  ].iloc[4]
               ),
-              "Bullish FVG invalidated, then retested from below"
+              "Bullish FVG invalidated and retested from below"
           )
 
+          # TEST 6: Bullish IFVG
           bearish_zone_data = pd.DataFrame({
-              "Open":  [13, 12, 10, 13, 14],
-              "High":  [15, 13, 11, 15, 16],
-              "Low":   [12, 10, 8, 12, 13],
-              "Close": [14, 11, 9, 14, 14],
+              "Open": [13, 12, 10, 13, 14],
+              "High": [15, 13, 11, 15, 16],
+              "Low": [12, 10, 8, 12, 11.5],
+              "Close": [14, 11, 9, 14, 12.5],
               "ATR14": [1, 1, 1, 1, 1],
           })
 
@@ -232,19 +220,21 @@ jobs:
               bearish_zone_data
           )
 
-          bearish_ifvg_result = engine.detect_ifvg(
+          bullish_ifvg_result = engine.detect_ifvg(
               bearish_zone_data
           )
 
           record(
               "Bullish IFVG",
               bool(
-                  bearish_ifvg_result["BULLISH_IFVG"].iloc[4]
+                  bullish_ifvg_result[
+                      "BULLISH_IFVG"
+                  ].iloc[4]
               ),
-              "Bearish FVG invalidated, then retested from above"
+              "Bearish FVG invalidated and retested from above"
           )
 
-          # Test 5: Displacement.
+          # TEST 7: Bullish displacement
           displacement_data = pd.DataFrame({
               "Open": [10, 10],
               "High": [12, 15],
@@ -267,7 +257,7 @@ jobs:
               "Body ratio and ATR threshold"
           )
 
-          # Test 6: EMA100 retest.
+          # TEST 8: Bullish EMA100 retest
           ema_data = pd.DataFrame({
               "Open": [99],
               "High": [101],
@@ -288,22 +278,26 @@ jobs:
                       "BULLISH_EMA100_RETEST"
                   ].iloc[0]
               ),
-              "Touches tolerance zone and closes bullish above EMA"
+              "Touches EMA zone and closes bullish above EMA"
           )
 
-          # ------------------------------------------
-          # LIVE HISTORICAL DATA TESTS
-          # ------------------------------------------
+          # ==========================================
+          # 2. MARKET DATA TESTS
+          # ==========================================
 
           print("\n========== MARKET DATA TESTS ==========")
 
           def extract_symbol(raw, ticker):
+
               if raw is None or raw.empty:
                   return None
 
               if isinstance(raw.columns, pd.MultiIndex):
+
                   for level in range(raw.columns.nlevels):
+
                       if ticker in raw.columns.get_level_values(level):
+
                           raw = raw.xs(
                               ticker,
                               axis=1,
@@ -320,6 +314,7 @@ jobs:
               return raw[required].copy()
 
           def closed_candles(df, minutes):
+
               if df is None or df.empty:
                   return pd.DataFrame()
 
@@ -340,6 +335,7 @@ jobs:
               ].sort_index()
 
           def resample_complete(df, hours):
+
               pieces = []
               rule = f"{hours}h"
 
@@ -355,13 +351,16 @@ jobs:
               now = pd.Timestamp.now(tz="UTC")
 
               for start, group in grouped:
+
                   if group.empty or len(group) != hours:
                       continue
 
-                  diffs = group.index.to_series().diff().dropna()
+                  differences = (
+                      group.index.to_series().diff().dropna()
+                  )
 
                   if not (
-                      diffs == pd.Timedelta(hours=1)
+                      differences == pd.Timedelta(hours=1)
                   ).all():
                       continue
 
@@ -381,19 +380,23 @@ jobs:
 
               result = pd.DataFrame(pieces).set_index("time")
               result.index.name = "Datetime"
+
               return result
 
           def test_market(pair, timeframe, data):
+
               name = f"{pair} {timeframe}"
 
               try:
+
                   if data is None or data.empty:
                       raise ValueError("No market data")
 
                   df = engine.calculate_price_action(data)
 
                   missing = [
-                      c for c in REQUIRED if c not in df.columns
+                      col for col in REQUIRED
+                      if col not in df.columns
                   ]
 
                   if missing:
@@ -401,18 +404,17 @@ jobs:
                           "Missing columns: " + ", ".join(missing)
                       )
 
-                  # ATR and EMA must have usable values.
                   for col in ["ATR14", "EMA100"]:
-                      count = np.isfinite(
+
+                      valid_count = np.isfinite(
                           df[col].to_numpy(dtype=float)
                       ).sum()
 
-                      if count == 0:
+                      if valid_count == 0:
                           raise ValueError(
                               f"No finite values in {col}"
                           )
 
-                  # Detection columns must be boolean.
                   boolean_columns = [
                       "BSL_SWEEP",
                       "SSL_SWEEP",
@@ -427,6 +429,7 @@ jobs:
                   ]
 
                   for col in boolean_columns:
+
                       if not pd.api.types.is_bool_dtype(df[col]):
                           raise ValueError(
                               f"{col} is not boolean"
@@ -449,9 +452,10 @@ jobs:
               ("1h", "730d", 60),
           ]:
 
-              print(f"\nDownloading {interval}...")
+              print(f"\nDownloading {interval} data...")
 
               try:
+
                   raw = yf.download(
                       tickers=list(TICKERS.values()),
                       period=period,
@@ -461,14 +465,18 @@ jobs:
                       progress=False,
                       threads=False
                   )
+
               except Exception as exc:
+
                   print("Download error:", exc)
                   raw = pd.DataFrame()
 
               for pair, ticker in TICKERS.items():
+
                   symbol_data = extract_symbol(raw, ticker)
 
                   if symbol_data is not None:
+
                       symbol_data = closed_candles(
                           symbol_data,
                           minutes
@@ -478,15 +486,22 @@ jobs:
 
               time.sleep(2)
 
+          # Direct timeframes
           for pair in TICKERS:
+
               for interval in ["15m", "30m", "1h"]:
+
                   data = downloaded.get((pair, interval))
+
                   test_market(pair, interval, data)
 
+          # Resampled timeframes
           for pair in TICKERS:
+
               hourly = downloaded.get((pair, "1h"))
 
               for hours in [2, 4]:
+
                   if hourly is None or hourly.empty:
                       data = pd.DataFrame()
                   else:
@@ -494,21 +509,29 @@ jobs:
 
                   test_market(pair, f"{hours}h", data)
 
-          # ------------------------------------------
-          # FINAL REPORT
-          # ------------------------------------------
+          # ==========================================
+          # 3. FINAL REPORT
+          # ==========================================
 
-          passed = sum(1 for _, status, _ in results if status == "PASS")
-          failed = sum(1 for _, status, _ in results if status == "FAIL")
+          passed = sum(
+              1 for _, status, _ in results
+              if status == "PASS"
+          )
+
+          failed = sum(
+              1 for _, status, _ in results
+              if status == "FAIL"
+          )
 
           print("\n========== FINAL REPORT ==========")
           print("Total tests:", len(results))
           print("Passed:", passed)
           print("Failed:", failed)
+          print("Synthetic tests expected: 9")
           print("Market tests expected: 70")
           print("1D tests: 0")
 
-          if failed or len(results) != 79:
+          if len(results) != 79 or failed:
               print("\nSTATUS: FAILED")
               sys.exit(1)
 
