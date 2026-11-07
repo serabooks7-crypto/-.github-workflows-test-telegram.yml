@@ -1,0 +1,117 @@
+name: PK BOT V6.4 - RVI 8-6 Test
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/pk-v6-4-rvi-test.yml"
+      - ".github/workflows/pk_v6_4_indicators.py"
+
+jobs:
+  rvi-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy
+
+      - name: Test RVI 8 and Signal 6
+        run: |
+          python - <<'PY'
+          import sys
+          import numpy as np
+          import pandas as pd
+
+          sys.path.insert(0, ".github/workflows")
+
+          from pk_v6_4_indicators import calculate_rvi
+
+          print("PK BOT V6.4 RVI TEST")
+          print("----------------------------")
+
+          np.random.seed(42)
+
+          n = 300
+          close = 2000 + np.cumsum(
+              np.random.normal(0, 2, n)
+          )
+
+          open_price = close + np.random.normal(0, 1, n)
+          high = np.maximum(open_price, close) + 2
+          low = np.minimum(open_price, close) - 2
+
+          df = pd.DataFrame({
+              "Open": open_price,
+              "High": high,
+              "Low": low,
+              "Close": close
+          })
+
+          result = calculate_rvi(
+              df.copy(),
+              period=8,
+              signal_period=6
+          )
+
+          assert "RVI" in result.columns
+          assert "RVI_SIGNAL" in result.columns
+          print("PASS: RVI and RVI_SIGNAL columns exist")
+
+          numerator = (
+              df["Close"] - df["Open"]
+          ).rolling(8, min_periods=8).mean()
+
+          denominator = (
+              df["High"] - df["Low"]
+          ).rolling(8, min_periods=8).mean()
+
+          expected_rvi = numerator / denominator
+
+          np.testing.assert_allclose(
+              result["RVI"].to_numpy(),
+              expected_rvi.to_numpy(),
+              equal_nan=True
+          )
+
+          print("PASS: Main RVI period = 8")
+
+          weights = np.arange(1, 7, dtype=float)
+
+          expected_signal = expected_rvi.rolling(
+              6,
+              min_periods=6
+          ).apply(
+              lambda x: np.dot(x, weights) / weights.sum(),
+              raw=True
+          )
+
+          np.testing.assert_allclose(
+              result["RVI_SIGNAL"].to_numpy(),
+              expected_signal.to_numpy(),
+              equal_nan=True
+          )
+
+          print("PASS: Signal Line period = 6")
+          print("PASS: WMA weights = 1,2,3,4,5,6")
+
+          valid = result[
+              ["RVI", "RVI_SIGNAL"]
+          ].dropna()
+
+          assert not valid.empty
+          assert np.isfinite(valid.to_numpy()).all()
+
+          print("PASS: No NaN or Infinity in valid output")
+          print("----------------------------")
+          print("ALL RVI TESTS PASSED")
+          PY
